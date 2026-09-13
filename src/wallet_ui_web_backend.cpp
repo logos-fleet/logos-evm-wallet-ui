@@ -23,6 +23,22 @@ const QString kKeystore = QStringLiteral("keystore_module");
 constexpr int kStartupPollMs = 100;
 constexpr int kStartupGiveUpMs = 60000;
 
+// HOW LONG AFTER ADMISSION THE FIRST OUTBOUND CALL WAITS, and it is not
+// padding. The last step of a load — registering this module's credential with
+// capability_module, without which every call it makes is refused "token not
+// recognized" — happens on the CORE, after it reads the contract-query reply
+// this image sent. The page cannot observe that step: there is no frame for it
+// and no signal on this side of the bridge. So the wait is a settle, stated as
+// one rather than hidden inside a poll interval, and it is generous because the
+// thing it is waiting for takes microseconds once the reply has landed.
+//
+// It is also why the first ask RETRIES. A refusal here is a race, not an
+// answer, and a wallet that showed "no accounts" because it asked half a second
+// early would be wrong in the way that is hardest to notice.
+constexpr int kAdmissionSettleMs = 2000;
+constexpr int kAccountRetries = 3;
+constexpr int kAccountRetryMs = 3000;
+
 // `{ "ok": true, "result": … }` / `{ "ok": false, "error": … }` — eth_rpc's
 // envelope, and the keystore's. Read here rather than in each caller so a
 // refusal is never mistaken for a value.
@@ -70,30 +86,42 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     startWhenReachable();
 }
 
-// THE DOOR IS NOT OPEN AT CONSTRUCTION. This image is up before the page has
-// bound the container's bridge — the host's own PageChannel says so — so the
-// first call has to be made when the channel appears rather than now. A poll
-// rather than a signal because the seam that would carry one is JavaScript's,
-// on the other side of embind, and a 100 ms tick costs nothing against a page
-// that takes seconds to come up.
+// THE DOOR IS NOT OPEN AT CONSTRUCTION, and "open" is not the edge to wait for.
+// This image is up before the page has bound the container's bridge, so the
+// first call cannot be made now. But the bridge resolves EARLY — while the
+// container is still asking the page what it serves — and an outbound call
+// made in that window is a synchronous native call on the container's own
+// thread, inside its own admission round trip: the capability handshake runs
+// for its whole budget against a module the core has not finished registering,
+// the container's deadline passes underneath it, and the module is reported as
+// "the page never published a module".
 //
-// It gives up. A `web` variant loaded with no host (a page opened by hand, a
-// container with no core) would otherwise poll for the life of the process,
-// and a module that says what is wrong is worth more than one that keeps
-// trying silently.
+// MEASURED, on the iPad Air 13-inch simulator, which is how this comment came
+// to exist: waiting on canCallModules() alone failed the load exactly that way.
+// So the wait is hostAdmitted() — the core has sent this page the credential it
+// minted for it, which is the last step of the load and the first moment
+// anything here could be authorized anyway.
+//
+// A poll rather than a signal because the seam that would carry one is
+// JavaScript's, on the other side of embind, and a 100 ms tick costs nothing
+// against a page that takes seconds to come up. It gives up: a `web` variant
+// loaded with no host (a page opened by hand, a container with no core) would
+// otherwise poll for the life of the process, and a module that says what is
+// wrong is worth more than one that keeps trying silently.
 void WalletUiWebBackend::startWhenReachable()
 {
     m_startup.setInterval(kStartupPollMs);
     connect(&m_startup, &QTimer::timeout, this, [this]() {
-        if (logos::web::canCallModules()) {
+        if (logos::web::hostAdmitted()) {
             m_startup.stop();
-            refreshAccounts();
+            QTimer::singleShot(kAdmissionSettleMs, this,
+                               [this]() { refreshAccounts(); });
             return;
         }
         if (++m_startupTicks * kStartupPollMs > kStartupGiveUpMs) {
             m_startup.stop();
             setStatusText(QStringLiteral(
-                "No host channel: this page is not bound to a Logos container"));
+                "No host: this page was never admitted by a Logos container"));
         }
     });
     m_startup.start();
@@ -244,8 +272,14 @@ void WalletUiWebBackend::refreshAccounts()
         [this](const logos::web::ModuleCallResult& res) {
             if (!res.ok) {
                 setStatusText(QStringLiteral("keystore_module: %1").arg(res.error));
+                // See kAdmissionSettleMs: a refusal this early is a race with
+                // the core's own load path, not an answer.
+                if (m_accountRetries++ < kAccountRetries)
+                    QTimer::singleShot(kAccountRetryMs, this,
+                                       [this]() { refreshAccounts(); });
                 return;
             }
+            m_accountRetries = 0;
             // The keystore answers a JSON TEXT, as every rust-first module on
             // this wire does; `{ok, accounts:[…]}` once parsed.
             const QJsonObject reply =
