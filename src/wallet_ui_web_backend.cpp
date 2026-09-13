@@ -83,6 +83,29 @@ QString jsonText(const QJsonObject& obj)
     return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
 }
 
+// The two flags every startup line and every outbound call is announced with,
+// always together and always in the same words: "the page has a channel" and
+// "the core has admitted this module" fail for different reasons, and only the
+// second is the one to act on.
+QString doorState()
+{
+    return QStringLiteral("channel=%1 admitted=%2")
+        .arg(logos::web::canCallModules() ? "yes" : "no")
+        .arg(logos::web::hostAdmitted() ? "yes" : "no");
+}
+
+// WHAT A SLOT WITH A RETURN VALUE ANSWERS when the work it started is on the
+// other side of the door: the ask was TAKEN, and the answer will land in a
+// PROP. The counterpart of `refuse()`, which is the same envelope for a method
+// this variant cannot serve at all.
+QString accepted()
+{
+    QJsonObject out;
+    out.insert(QStringLiteral("ok"), true);
+    out.insert(QStringLiteral("pending"), true);
+    return jsonText(out);
+}
+
 } // namespace
 
 WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
@@ -147,13 +170,10 @@ void WalletUiWebBackend::startWhenReachable()
             return;
         }
         ++m_startupTicks;
-        // ONCE A SECOND WHILE IT WAITS, and the two flags separately: "the page
-        // has a channel" and "the core has admitted this module" fail for
-        // different reasons and only the second is the one to act on.
+        // ONCE A SECOND WHILE IT WAITS, and both flags (see doorState).
         if (m_startupTicks % (1000 / kStartupPollMs) == 0)
-            announce(QStringLiteral("waiting for admission: channel=%1 admitted=%2 (%3 ms)")
-                         .arg(logos::web::canCallModules() ? "yes" : "no")
-                         .arg(logos::web::hostAdmitted() ? "yes" : "no")
+            announce(QStringLiteral("waiting for admission: %1 (%2 ms)")
+                         .arg(doorState())
                          .arg(m_startupTicks * kStartupPollMs));
         if (m_startupTicks * kStartupPollMs > kStartupGiveUpMs) {
             m_startup.stop();
@@ -302,20 +322,14 @@ QString WalletUiWebBackend::testEndpoint(int chainId)
                               ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
                               : QStringLiteral("chain %1 answered").arg(chainId));
         });
-    QJsonObject out;
-    out.insert(QStringLiteral("ok"), true);
-    out.insert(QStringLiteral("pending"), true);
-    return jsonText(out);
+    return accepted();
 }
 
 // ── accounts: keystore_module ────────────────────────────────────────────────
 
 void WalletUiWebBackend::refreshAccounts()
 {
-    announce(QStringLiteral("refreshAccounts: asking %1, channel=%2 admitted=%3")
-                 .arg(kKeystore)
-                 .arg(logos::web::canCallModules() ? "yes" : "no")
-                 .arg(logos::web::hostAdmitted() ? "yes" : "no"));
+    announce(QStringLiteral("refreshAccounts: asking %1, %2").arg(kKeystore, doorState()));
     logos::web::callModuleAsync(
         kKeystore, QStringLiteral("list_accounts"), QJsonArray{},
         [this](const logos::web::ModuleCallResult& res) {
@@ -375,10 +389,7 @@ QString WalletUiWebBackend::createAccount(QString passphrase, QString label)
             setStatusText(QStringLiteral("Account created"));
             refreshAccounts();
         });
-    QJsonObject out;
-    out.insert(QStringLiteral("ok"), true);
-    out.insert(QStringLiteral("pending"), true);
-    return jsonText(out);
+    return accepted();
 }
 
 QString WalletUiWebBackend::importMnemonic(QString phraseJson, QString label)
@@ -415,11 +426,10 @@ void WalletUiWebBackend::refreshBalances(QString address)
     m_balances = QJsonObject();
     m_balancePending = 0;
     setStatusText(QStringLiteral("Refreshing balances…"));
-    announce(QStringLiteral("refreshBalances(%1): %2 chain(s), channel=%3 admitted=%4")
+    announce(QStringLiteral("refreshBalances(%1): %2 chain(s), %3")
                  .arg(address)
                  .arg(m_chains.size())
-                 .arg(logos::web::canCallModules() ? "yes" : "no")
-                 .arg(logos::web::hostAdmitted() ? "yes" : "no"));
+                 .arg(doorState()));
 
     for (const QJsonValue& c : m_chains) {
         const QJsonObject o = c.toObject();
@@ -491,8 +501,7 @@ void WalletUiWebBackend::publishBalances()
     root.insert(QStringLiteral("balances"), inner);
     setBalancesJson(jsonText(root));
     setStatusText(QStringLiteral("Balances updated"));
-    announce(QStringLiteral("published balances: %1")
-                 .arg(QString::fromUtf8(QJsonDocument(inner).toJson(QJsonDocument::Compact))));
+    announce(QStringLiteral("published balances: %1").arg(jsonText(inner)));
 }
 
 // ── everything the coordinator owns ──────────────────────────────────────────
