@@ -51,6 +51,22 @@ Item {
         return root.chains.length ? root.chains[privChain.currentIndex].chainId : 11155111
     }
 
+    // WHAT THIS VIEW IS RENDERING, on the console, the moment it renders it.
+    //
+    // A `web` variant draws into a canvas: from outside the page there is no
+    // scene graph to query and no label to read, and a host driving it can see
+    // only what the page says about itself (the container forwards a page's
+    // console to the app's log). So the one state this module exists to show —
+    // the balances, and which account they are for — is announced where a
+    // device run can read it. Harmless on the desktop, where it is the same
+    // line in the same place.
+    onBalancesChanged: {
+        if (balances && balances.chains && balances.chains.length > 0)
+            console.log("wallet_ui: rendering balances for "
+                        + (backend ? backend.selectedAccount : "?")
+                        + " -- " + JSON.stringify(balances.chains))
+    }
+
     // Doctest hook: switch the active tab deterministically. qt-mcp drives this via
     // `call_method` (find_by objectName "walletRoot", method "selectTab", args [i]),
     // the same pattern the tutorial QML UI uses for coreModulesView.openInterface.

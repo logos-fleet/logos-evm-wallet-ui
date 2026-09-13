@@ -11,6 +11,14 @@
   "dependencies": ["eth_rpc_module", "keystore_module", "token_list_module", "uniswap_module", "railgun_module", "wallet_backend_module"],
   "codegen": { "rep": "src/wallet_ui.rep" },
 
+  "web": {
+    "view_backend": {
+      "class": "WalletUiWebBackend",
+      "header": "src/wallet_ui_web_backend.h",
+      "sources": ["src/wallet_ui_web_backend.cpp"]
+    }
+  },
+
   "nix": {
     "packages": {
       "build": [],
