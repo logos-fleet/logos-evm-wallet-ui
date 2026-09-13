@@ -6,24 +6,39 @@
   "category": "wallet",
   "description": "Multi-chain EVM wallet (Metamask-like): C++ backend over wallet_backend_module with a QML view.",
   "main": "wallet_ui_plugin",
-  "icon": null,
+  "icon": "src/icons/wallet.png",
   "view": "qml/WalletView.qml",
-  "dependencies": ["eth_rpc_module", "keystore_module", "token_list_module", "uniswap_module", "railgun_module", "wallet_backend_module"],
-  "codegen": { "rep": "src/wallet_ui.rep" },
-
+  "dependencies": [
+    "eth_rpc_module",
+    "keystore_module",
+    "token_list_module",
+    "uniswap_module",
+    "wallet_backend_module"
+  ],
+  "codegen": {
+    "rep": "src/wallet_ui.rep"
+  },
   "web": {
-    "dependencies": ["eth_rpc_module", "keystore_module"],
+    "dependencies": [
+      "eth_rpc_module",
+      "keystore_module"
+    ],
     "view_backend": {
       "class": "WalletUiWebBackend",
       "header": "src/wallet_ui_web_backend.h",
-      "sources": ["src/wallet_ui_web_backend.cpp"]
+      "sources": [
+        "src/wallet_ui_web_backend.cpp"
+      ]
     }
   },
-
   "nix": {
     "packages": {
       "build": [],
-      "runtime": ["qt6.qtdeclarative", "zstd", "krb5", "abseil-cpp"]
+      "runtime": [
+        "qt6.qtdeclarative",
+        "zstd",
+        "abseil-cpp"
+      ]
     },
     "external_libraries": [],
     "cmake": {

@@ -328,28 +328,14 @@ QString WalletUiWebBackend::importMnemonic(QString phraseJson, QString label)
     return refuse(QStringLiteral("Mnemonic import"), kKeystore);
 }
 
-bool WalletUiWebBackend::unlock(QString address, QString passphrase)
+QString WalletUiWebBackend::sendStatus(QString requestId)
 {
-    setStatusText(QStringLiteral("Unlocking…"));
-    logos::web::callModuleAsync(
-        kKeystore, QStringLiteral("unlock"), QJsonArray{ address, passphrase },
-        [this](const logos::web::ModuleCallResult& res) {
-            const bool ok = res.ok && res.value.toBool();
-            setAccountUnlocked(ok);
-            setStatusText(ok ? QStringLiteral("Unlocked")
-                             : QStringLiteral("Wrong passphrase"));
-        });
-    return true;
-}
-
-bool WalletUiWebBackend::lock(QString address)
-{
-    logos::web::callModuleAsync(kKeystore, QStringLiteral("lock"),
-                                QJsonArray{ address },
-                                [](const logos::web::ModuleCallResult&) {});
-    setAccountUnlocked(false);
-    setStatusText(QStringLiteral("Locked"));
-    return true;
+    Q_UNUSED(requestId)
+    // Nothing this variant does raises a signing request, so nothing can be
+    // pending. Naming the module keeps the refusal diagnosable rather than
+    // letting a poll spin against a state that will never change.
+    return refuse(QStringLiteral("Signing requests"),
+                  QStringLiteral("wallet_backend_module"));
 }
 
 // ── balances: the Bundled eth_rpc_module ─────────────────────────────────────
@@ -484,33 +470,4 @@ void WalletUiWebBackend::refreshHistory(QString address)
     Q_UNUSED(address)
     refuse(QStringLiteral("History"), QStringLiteral("wallet_backend_module"));
     setHistoryJson(QStringLiteral("{\"history\":[]}"));
-}
-
-QString WalletUiWebBackend::initPrivate(QString address, int chainId)
-{
-    Q_UNUSED(address)
-    Q_UNUSED(chainId)
-    return refuse(QStringLiteral("Private accounts"), QStringLiteral("railgun_module"));
-}
-
-void WalletUiWebBackend::syncPrivate()
-{
-    refuse(QStringLiteral("Private accounts"), QStringLiteral("railgun_module"));
-}
-
-void WalletUiWebBackend::refreshShieldedBalance()
-{
-    refuse(QStringLiteral("Private accounts"), QStringLiteral("railgun_module"));
-}
-
-QString WalletUiWebBackend::shield(QString sendJson)
-{
-    Q_UNUSED(sendJson)
-    return refuse(QStringLiteral("Shielding"), QStringLiteral("railgun_module"));
-}
-
-QString WalletUiWebBackend::privateSend(QString sendJson)
-{
-    Q_UNUSED(sendJson)
-    return refuse(QStringLiteral("Private send"), QStringLiteral("railgun_module"));
 }

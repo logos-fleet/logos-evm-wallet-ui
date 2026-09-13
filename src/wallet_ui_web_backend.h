@@ -30,7 +30,7 @@
 // So the `web` variant is the wallet's thin half: accounts out of
 // `keystore_module` (itself a `web` variant on a phone) and balances straight
 // out of the Bundled `eth_rpc_module`. Everything the coordinator owns —
-// sends, the market, history, RAILGUN — REFUSES BY NAME rather than returning
+// sends, the market, history — REFUSES BY NAME rather than returning
 // a plausible empty value, so a user is told the variant cannot do it and a
 // developer is told which module is missing.
 //
@@ -54,8 +54,11 @@ public slots:
     QString createAccount(QString passphrase, QString label) override;
     QString importMnemonic(QString phraseJson, QString label) override;
     void refreshAccounts() override;
-    bool unlock(QString address, QString passphrase) override;
-    bool lock(QString address) override;
+
+    // A signing request the wallet raised, polled by the view until a human
+    // answers it in the signer UI. This variant never raises one — it cannot
+    // send — so it refuses by name like the rest of the coordinator's surface.
+    QString sendStatus(QString requestId) override;
 
     // Balances — eth_rpc_module
     void refreshBalances(QString address) override;
@@ -72,13 +75,6 @@ public slots:
 
     // History
     void refreshHistory(QString address) override;
-
-    // Private (RAILGUN)
-    QString initPrivate(QString address, int chainId) override;
-    void syncPrivate() override;
-    void refreshShieldedBalance() override;
-    QString shield(QString sendJson) override;
-    QString privateSend(QString sendJson) override;
 
 private:
     // THE VARIANT STARTS ITSELF. There is no onContextReady in a wasm image:

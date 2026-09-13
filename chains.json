@@ -1,0 +1,38 @@
+{
+  "42161": {
+    "endpoint": "https://arb1.arbitrum.io/rpc",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  },
+  "1": {
+    "endpoint": "https://eth.llamarpc.com",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  },
+  "10": {
+    "endpoint": "https://mainnet.optimism.io",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  },
+  "8453": {
+    "endpoint": "https://mainnet.base.org",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  },
+  "137": {
+    "endpoint": "https://polygon-rpc.com",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  },
+  "11155111": {
+    "endpoint": "https://ethereum-sepolia-rpc.publicnode.com",
+    "proxy": null,
+    "proxyRequired": false,
+    "timeoutSecs": 30
+  }
+}

@@ -38,17 +38,11 @@ Item {
     readonly property var tokens: parseField(backend ? backend.tokensJson : "", "tokens", [])
     readonly property var history: parseField(backend ? backend.historyJson : "", "history", [])
     readonly property var market: parseField(backend ? backend.marketJson : "", "chains", [])
-    readonly property var shielded: parseField(backend ? backend.shieldedBalanceJson : "", "balances", [])
 
     function parseField(json, field, fallback) {
         if (!json) return fallback
         try { var o = JSON.parse(json); return (o && o[field] !== undefined) ? o[field] : fallback }
         catch (e) { return fallback }
-    }
-
-    // Active chain id for the Private tab (defaults to Sepolia 11155111).
-    function privChainId() {
-        return root.chains.length ? root.chains[privChain.currentIndex].chainId : 11155111
     }
 
     // WHAT THIS VIEW IS RENDERING, on the console, the moment it renders it.
@@ -87,6 +81,15 @@ Item {
         color: Theme.palette.background
     }
 
+    // Drives a raised signing request to completion. The decision itself happens
+    // in the Signer app; this only asks the backend whether it has landed yet.
+    Timer {
+        interval: 1000
+        repeat: true
+        running: root.ready && backend && backend.pendingRequestId !== ""
+        onTriggered: backend.sendStatus(backend.pendingRequestId)
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: Theme.spacing.medium
@@ -121,12 +124,13 @@ Item {
                     backend.selectedAccount = root.accounts[0]
                 }
             }
-            LogosButton {
-                text: backend && backend.accountUnlocked ? "Lock" : "Unlock"
-                enabled: root.ready && acctBox.currentText.length > 0
-                onClicked: backend && backend.accountUnlocked
-                           ? backend.lock(acctBox.currentText)
-                           : unlockDialog.open()
+            // There is no unlock any more: this wallet never holds a vault
+            // password. When a send needs a signature, the human approves it in
+            // the Signer app; this only reports that one is waiting.
+            LogosText {
+                visible: root.ready && backend && backend.pendingRequestId !== ""
+                text: "Waiting for approval in the Signer app"
+                textFormat: Text.PlainText
             }
             LogosButton { text: "New"; enabled: root.ready; onClicked: createDialog.open() }
         }
@@ -141,7 +145,6 @@ Item {
             LogosTabButton { text: "Send" }
             LogosTabButton { text: "Tokens" }
             LogosTabButton { text: "History" }
-            LogosTabButton { text: "Private" }
             LogosTabButton { text: "Settings" }
             LogosTabButton { text: "Advanced" }
         }
@@ -252,7 +255,7 @@ Item {
                                                    function (e) { feePreview.text = "estimate failed" })
                         }
                         LogosButton {
-                            text: "Send transaction"; enabled: root.ready && backend && backend.accountUnlocked
+                            text: "Send transaction"; enabled: root.ready && backend && backend.pendingRequestId === ""
                             onClicked: {
                                 var m = isErc20.checked ? backend.sendErc20(JSON.stringify(buildSend()))
                                                         : backend.sendNative(JSON.stringify(buildSend()))
@@ -301,6 +304,7 @@ Item {
                         }
                     }
                     LogosText {
+                        objectName: "historyEmpty"
                         visible: !root.history || root.history.length === 0
                         text: "No transactions yet"; color: Theme.palette.textTertiary; font.pixelSize: Theme.typography.secondaryText
                     }
@@ -321,111 +325,7 @@ Item {
                 }
             }
 
-            // ── 5 · Private (RAILGUN — UNAUDITED upstream, Sepolia-first) ──
-            LogosScrollView {
-                clip: true
-                ColumnLayout {
-                    width: pages.width - 16
-                    spacing: Theme.spacing.small
-
-                    // Prominent unaudited / testnet warning.
-                    LogosFrame {
-                        Layout.fillWidth: true
-                        backgroundColor: Theme.palette.surfaceRaised
-                        borderColor: Theme.palette.warning
-                        ColumnLayout {
-                            anchors.fill: parent
-                            LogosText { text: "⚠ Private transactions (RAILGUN)"; font.weight: Theme.typography.weightBold; color: Theme.palette.warning }
-                            LogosText {
-                                Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textSecondary
-                                text: "Experimental. The underlying engine is UNAUDITED — use on Sepolia (testnet) only; " +
-                                      "do not move mainnet funds here. Proving a private send can take a while."
-                            }
-                        }
-                    }
-
-                    LogosComboBox { id: privChain; Layout.fillWidth: true; textRole: "name"; model: root.chains; placeholderText: "Network" }
-
-                    // Enable the private account + show the 0zk address.
-                    RowLayout {
-                        Layout.fillWidth: true
-                        LogosButton {
-                            text: backend && backend.zkAddress.length ? "Re-enable" : "Enable private account"
-                            enabled: root.ready && backend && backend.accountUnlocked && acctBox.currentText.length > 0
-                            onClicked: logos.watch(backend.initPrivate(acctBox.currentText, root.privChainId()),
-                                                   function (r) {}, function (e) {})
-                        }
-                        LogosButton {
-                            text: "Sync"; enabled: root.ready && backend && backend.zkAddress.length > 0
-                            onClicked: backend.syncPrivate()
-                        }
-                    }
-                    LogosText {
-                        Layout.fillWidth: true; font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textSecondary; elide: Text.ElideMiddle
-                        text: backend && backend.zkAddress.length
-                              ? ("0zk: " + backend.zkAddress)
-                              : "Not enabled — unlock an account, then enable."
-                    }
-
-                    // Shielded balances.
-                    RowLayout {
-                        Layout.fillWidth: true
-                        LogosText { text: "Shielded balance"; font.weight: Theme.typography.weightBold; Layout.fillWidth: true }
-                        LogosButton {
-                            text: "Refresh"; enabled: backend && backend.zkAddress.length > 0
-                            onClicked: backend.refreshShieldedBalance()
-                        }
-                    }
-                    Repeater {
-                        model: root.shielded
-                        RowLayout {
-                            Layout.fillWidth: true
-                            LogosText {
-                                font.pixelSize: Theme.typography.secondaryText; Layout.fillWidth: true; elide: Text.ElideMiddle
-                                text: (modelData.asset && modelData.asset.erc20) ? modelData.asset.erc20 : "asset"
-                            }
-                            LogosText { font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.success; text: "" + modelData.amount }
-                        }
-                    }
-                    LogosText {
-                        visible: !root.shielded || root.shielded.length === 0
-                        text: "No shielded balance"; color: Theme.palette.textTertiary; font.pixelSize: Theme.typography.secondaryText
-                    }
-
-                    // Shield (public → private).
-                    LogosText { text: "Shield (deposit public → private)"; font.weight: Theme.typography.weightBold }
-                    LogosTextField { id: shieldAsset; Layout.fillWidth: true; placeholderText: "ERC-20 token address (0x…)" }
-                    LogosTextField { id: shieldAmount; Layout.fillWidth: true; placeholderText: "Amount (base units)" }
-                    LogosButton {
-                        text: "Shield"
-                        enabled: root.ready && backend && backend.accountUnlocked && backend.zkAddress.length > 0
-                        onClicked: logos.watch(backend.shield(JSON.stringify({
-                            from: acctBox.currentText, chainId: root.privChainId(),
-                            asset: shieldAsset.text, amount: shieldAmount.text
-                        })), function (r) {}, function (e) {})
-                    }
-
-                    // Private send — 0zk… → private transfer, 0x… → unshield (via the 4337 relayer).
-                    LogosText { text: "Private send (the relayer hides the sender)"; font.weight: Theme.typography.weightBold }
-                    LogosTextField { id: privTo; Layout.fillWidth: true; placeholderText: "Recipient — 0zk… (private) or 0x… (withdraw)" }
-                    LogosTextField { id: privAsset; Layout.fillWidth: true; placeholderText: "ERC-20 token address (0x…)" }
-                    LogosTextField { id: privAmount; Layout.fillWidth: true; placeholderText: "Amount (base units)" }
-                    LogosTextField { id: privMemo; Layout.fillWidth: true; placeholderText: "Memo (optional — private transfers only)" }
-                    LogosTextField { id: privBundler; Layout.fillWidth: true; placeholderText: "Bundler URL (ERC-4337, Sepolia)" }
-                    LogosButton {
-                        text: "Send privately"
-                        enabled: root.ready && backend && backend.accountUnlocked
-                                 && backend.zkAddress.length > 0 && privBundler.text.length > 0
-                        onClicked: logos.watch(backend.privateSend(JSON.stringify({
-                            from: acctBox.currentText, chainId: root.privChainId(), to: privTo.text,
-                            asset: privAsset.text, amount: privAmount.text,
-                            memo: privMemo.text, bundlerUrl: privBundler.text
-                        })), function (r) {}, function (e) {})
-                    }
-                }
-            }
-
-            // ── 6 · Settings (privacy / proxy) ──
+            // ── 5 · Settings (privacy / proxy) ──
             LogosScrollView {
                 clip: true
                 ColumnLayout {
@@ -444,7 +344,7 @@ Item {
                 }
             }
 
-            // ── 7 · Advanced (custom networks + account import; dev / testing) ──
+            // ── 6 · Advanced (custom networks + account import; dev / testing) ──
             LogosScrollView {
                 clip: true
                 ColumnLayout {
@@ -517,10 +417,6 @@ Item {
                                 function (r) { advAcctResult.text = "Imported: " + r },
                                 function (e) { advAcctResult.text = "Import failed: " + e })
                         }
-                        LogosButton {
-                            text: "Unlock imported"; enabled: root.ready && acctBox.currentText.length > 0
-                            onClicked: backend.unlock(acctBox.currentText, advAcctPw.text)
-                        }
                     }
                     LogosText { id: advAcctResult; Layout.fillWidth: true; elide: Text.ElideMiddle; color: Theme.palette.textSecondary; font.pixelSize: Theme.typography.secondaryText }
                 }
@@ -578,13 +474,6 @@ Item {
     // Modals — plain Dialog with a Theme-coloured surface + Logos inner content
     // (the basecamp pattern); LogosDialog uses left/rightActions rather than
     // standardButtons, so we keep Dialog here for the simple Ok/Cancel flow.
-    Dialog {
-        id: unlockDialog; title: "Unlock account"; modal: true; anchors.centerIn: parent
-        standardButtons: Dialog.Ok | Dialog.Cancel
-        background: Rectangle { color: Theme.palette.backgroundSecondary; border.color: Theme.palette.borderSubtle; border.width: 1; radius: Theme.spacing.radiusLarge }
-        ColumnLayout { LogosTextField { id: unlockPw; placeholderText: "Passphrase"; echoMode: TextInput.Password } }
-        onAccepted: { backend.unlock(acctBox.currentText, unlockPw.text); unlockPw.text = "" }
-    }
     Dialog {
         id: createDialog; title: "New account"; modal: true; anchors.centerIn: parent
         standardButtons: Dialog.Ok | Dialog.Cancel

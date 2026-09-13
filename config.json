@@ -1,0 +1,56 @@
+{
+  "chains": [
+    {
+      "chainId": 1,
+      "name": "Ethereum",
+      "rpcUrl": "https://eth.llamarpc.com",
+      "nativeSymbol": "ETH",
+      "multicall3": null,
+      "explorer": "https://etherscan.io"
+    },
+    {
+      "chainId": 10,
+      "name": "Optimism",
+      "rpcUrl": "https://mainnet.optimism.io",
+      "nativeSymbol": "ETH",
+      "multicall3": null,
+      "explorer": "https://optimistic.etherscan.io"
+    },
+    {
+      "chainId": 42161,
+      "name": "Arbitrum One",
+      "rpcUrl": "https://arb1.arbitrum.io/rpc",
+      "nativeSymbol": "ETH",
+      "multicall3": null,
+      "explorer": "https://arbiscan.io"
+    },
+    {
+      "chainId": 8453,
+      "name": "Base",
+      "rpcUrl": "https://mainnet.base.org",
+      "nativeSymbol": "ETH",
+      "multicall3": null,
+      "explorer": "https://basescan.org"
+    },
+    {
+      "chainId": 137,
+      "name": "Polygon",
+      "rpcUrl": "https://polygon-rpc.com",
+      "nativeSymbol": "POL",
+      "multicall3": null,
+      "explorer": "https://polygonscan.com"
+    },
+    {
+      "chainId": 11155111,
+      "name": "Sepolia",
+      "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+      "nativeSymbol": "ETH",
+      "multicall3": null,
+      "explorer": "https://sepolia.etherscan.io"
+    }
+  ],
+  "proxy": {
+    "proxy": null,
+    "proxyRequired": false
+  }
+}

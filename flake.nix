@@ -3,16 +3,17 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # The backend the UI drives, plus its dependency modules. Declaring the whole
-    # tree as inputs lets the standalone app (mkLogosQmlModule's apps.default)
-    # bundle and auto-load every module in dependency order — without the leaf
-    # modules the backend can't load and the UI's calls time out.
-    wallet_backend_module.url = "github:logos-co/logos-evm-wallet-backend-module/910a7cd99731d120c79a9d964ac62c5cfc58b0e2";
-    eth_rpc_module.url = "github:logos-co/logos-evm-eth-rpc-module";
-    keystore_module.url = "github:logos-co/logos-evm-keystore-module";
-    token_list_module.url = "github:logos-co/logos-evm-token-list-module";
-    uniswap_module.url = "github:logos-co/logos-evm-uniswap-module";
-    railgun_module.url = "github:logos-co/logos-evm-railgun-module";
+    # The backend the UI drives. Declaring its whole dependency tree here is what
+    # lets the standalone app bundle and auto-load every module in order.
+    wallet_backend_module.url = "github:logos-co/logos-evm-wallet-backend-module/5ed06f701622389658d6b55d1b5c5a2bf6cce508";
+
+    # Each leaf is the backend's OWN locked input, never a second pin of our own:
+    # collectAllModuleDeps is `transitive // direct`, so a url here shadows the
+    # backend's lock and ships it a module it was not built against.
+    eth_rpc_module.follows = "wallet_backend_module/eth_rpc_module";
+    keystore_module.follows = "wallet_backend_module/keystore_module";
+    token_list_module.follows = "wallet_backend_module/token_list_module";
+    uniswap_module.follows = "wallet_backend_module/uniswap_module";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:

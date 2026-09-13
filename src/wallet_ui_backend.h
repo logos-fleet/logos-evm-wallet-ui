@@ -29,8 +29,6 @@ public:
     QString createAccount(QString passphrase, QString label) override;
     QString importMnemonic(QString phraseJson, QString label) override;
     void refreshAccounts() override;
-    bool unlock(QString address, QString passphrase) override;
-    bool lock(QString address) override;
 
     // Balances + tokens
     void refreshBalances(QString address) override;
@@ -44,16 +42,15 @@ public:
     QString estimateFee(QString sendJson) override;
     QString sendNative(QString sendJson) override;
     QString sendErc20(QString sendJson) override;
+    QString sendStatus(QString requestId) override;
 
     // History
     void refreshHistory(QString address) override;
 
-    // Private (RAILGUN) — UNAUDITED upstream, Sepolia-first
-    QString initPrivate(QString address, int chainId) override;
-    void syncPrivate() override;
-    void refreshShieldedBalance() override;
-    QString shield(QString sendJson) override;
-    QString privateSend(QString sendJson) override;
+private:
+    // Shared by sendNative/sendErc20: record the request id and tell the user
+    // where the decision happens.
+    QString trackSend(QString reply);
 
 protected:
     // Called once after the framework populates modules()/context.

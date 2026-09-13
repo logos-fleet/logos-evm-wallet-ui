@@ -80,22 +80,6 @@ void WalletUiBackend::refreshAccounts()
     setAccountsJson(modules().wallet_backend_module.list_accounts());
 }
 
-bool WalletUiBackend::unlock(QString address, QString passphrase)
-{
-    bool ok = modules().wallet_backend_module.unlock(address, passphrase);
-    setAccountUnlocked(ok);
-    setStatusText(ok ? QStringLiteral("Unlocked") : QStringLiteral("Wrong passphrase"));
-    return ok;
-}
-
-bool WalletUiBackend::lock(QString address)
-{
-    bool ok = modules().wallet_backend_module.lock(address);
-    setAccountUnlocked(false);
-    setStatusText(QStringLiteral("Locked"));
-    return ok;
-}
-
 // ── Balances + tokens ────────────────────────────────────────────────────────
 
 void WalletUiBackend::refreshBalances(QString address)
@@ -137,20 +121,45 @@ QString WalletUiBackend::estimateFee(QString sendJson)
     return modules().wallet_backend_module.estimate_fee(sendJson);
 }
 
+// A send no longer produces a transaction hash here. The wallet asks; a human
+// approves in the signer UI; only then is anything signed or broadcast. These
+// return a request id, and `sendStatus` carries it the rest of the way.
 QString WalletUiBackend::sendNative(QString sendJson)
 {
-    setStatusText(QStringLiteral("Sending…"));
-    QString r = modules().wallet_backend_module.send_native(sendJson);
-    setStatusText(QStringLiteral("Native transfer submitted"));
-    return r;
+    return trackSend(modules().wallet_backend_module.send_native(sendJson));
 }
 
 QString WalletUiBackend::sendErc20(QString sendJson)
 {
-    setStatusText(QStringLiteral("Sending…"));
-    QString r = modules().wallet_backend_module.send_erc20(sendJson);
-    setStatusText(QStringLiteral("ERC20 transfer submitted"));
-    return r;
+    return trackSend(modules().wallet_backend_module.send_erc20(sendJson));
+}
+
+QString WalletUiBackend::trackSend(QString reply)
+{
+    const QJsonObject o = QJsonDocument::fromJson(reply.toUtf8()).object();
+    if (!o.value(QStringLiteral("ok")).toBool()) {
+        setStatusText(QStringLiteral("Send failed"));
+        return reply;
+    }
+    setPendingRequestId(o.value(QStringLiteral("requestId")).toString());
+    setStatusText(QStringLiteral("Waiting for approval — open the Signer app"));
+    return reply;
+}
+
+QString WalletUiBackend::sendStatus(QString requestId)
+{
+    const QString reply = modules().wallet_backend_module.send_status(requestId);
+    const QJsonObject o = QJsonDocument::fromJson(reply.toUtf8()).object();
+    const QString state = o.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("done")) {
+        setPendingRequestId(QString());
+        setStatusText(QStringLiteral("Sent"));
+        refreshHistory(selectedAccount());
+    } else if (state == QStringLiteral("declined")) {
+        setPendingRequestId(QString());
+        setStatusText(QStringLiteral("Declined in the Signer app"));
+    }
+    return reply;
 }
 
 // ── History ──────────────────────────────────────────────────────────────────
@@ -158,54 +167,4 @@ QString WalletUiBackend::sendErc20(QString sendJson)
 void WalletUiBackend::refreshHistory(QString address)
 {
     setHistoryJson(modules().wallet_backend_module.get_history(address));
-}
-
-// ── Private (RAILGUN) ─────────────────────────────────────────────────────────
-//
-// ⚠️ UNAUDITED upstream engine; Sepolia-first. We only coordinate via
-// wallet_backend_module; the railgun spending/viewing keys never reach the UI.
-
-QString WalletUiBackend::initPrivate(QString address, int chainId)
-{
-    setStatusText(QStringLiteral("Enabling private account…"));
-    QString r = modules().wallet_backend_module.init_private(address, chainId);
-    // r = { ok, address: "0zk…" } — surface the 0zk address to the view.
-    QJsonObject o = QJsonDocument::fromJson(r.toUtf8()).object();
-    if (o.value(QStringLiteral("ok")).toBool()) {
-        setZkAddress(o.value(QStringLiteral("address")).toString());
-        setShieldedBalanceJson(modules().wallet_backend_module.get_shielded_balance());
-        setStatusText(QStringLiteral("Private account ready"));
-    } else {
-        setStatusText(QStringLiteral("Private init failed"));
-    }
-    return r;
-}
-
-void WalletUiBackend::syncPrivate()
-{
-    setStatusText(QStringLiteral("Syncing shielded state…"));
-    modules().wallet_backend_module.sync_private();
-    setShieldedBalanceJson(modules().wallet_backend_module.get_shielded_balance());
-    setStatusText(QStringLiteral("Shielded balance updated"));
-}
-
-void WalletUiBackend::refreshShieldedBalance()
-{
-    setShieldedBalanceJson(modules().wallet_backend_module.get_shielded_balance());
-}
-
-QString WalletUiBackend::shield(QString sendJson)
-{
-    setStatusText(QStringLiteral("Shielding…"));
-    QString r = modules().wallet_backend_module.shield(sendJson);
-    setStatusText(QStringLiteral("Shield submitted"));
-    return r;
-}
-
-QString WalletUiBackend::privateSend(QString sendJson)
-{
-    setStatusText(QStringLiteral("Sending privately (relayer)…"));
-    QString r = modules().wallet_backend_module.private_send(sendJson);
-    setStatusText(QStringLiteral("Private send submitted"));
-    return r;
 }

@@ -97,7 +97,14 @@ sections:
           # buttons fall below a 1000px viewport (the page is offscreen, so a tall
           # window is free). launch_timeout is generous because the whole app
           # bundle builds during launch.
-          launch: "nix run github:logos-co/logos-evm-wallet-ui{release} --no-write-lock-file -- --height 2000"
+          # --user-dir keeps this run's module state in the doctest workdir.
+          # The standalone app persists module state under the platform
+          # app-data location by default (logos-standalone-app #27), so
+          # without this every run — and the other spec in this suite —
+          # would inherit the previous one's chain config, including mock
+          # RPC endpoints that are already dead. The app then blocks
+          # verifying those endpoints at startup and the UI never appears.
+          launch: "nix run github:logos-co/logos-evm-wallet-ui{release} --no-write-lock-file -- --height 2000 --user-dir ./session"
           qt_mcp: "result-mcp"
           build_timeout: 2400
           launch_timeout: 2400
@@ -114,7 +121,7 @@ sections:
               find_by: "objectName"
               find_value: "walletRoot"
               method: "selectTab"
-              args: [7]
+              args: [6]
             - name: "Advanced tab rendered"
               action: wait_for
               texts: ["Custom network"]
@@ -175,13 +182,9 @@ sections:
               texts: ["Account imported"]
               timeout: 20000
               screenshot: "wallet-ui-e2e-import.png"
-            - name: "Unlock the imported account"
-              action: click
-              target: "Unlock imported"
-            - name: "Account unlocked (status flips)"
-              action: wait_for
-              texts: ["Unlocked"]
-              timeout: 15000
+            # There is no unlock step any more, and no "Unlocked" state to wait
+            # for: the wallet never holds the key. An imported account is an
+            # address it knows about, nothing more.
 
             # ── Send a native transfer through the Send tab ──
             - name: "Switch to the Send tab"
@@ -204,12 +207,18 @@ sections:
               find_by: "objectName"
               find_value: "sendAmountField"
               value: "0xde0b6b3a7640000"
-            - name: "Send (build → sign → broadcast → record)"
+            - name: "Send (build → REQUEST approval)"
+              # The wallet builds the transaction and asks. It cannot sign it:
+              # keystore's Tier A admits module:signer_ui and nothing else.
               action: click
               target: "Send transaction"
-            - name: "Native transfer submitted (status flips)"
+            - name: "It is waiting for a human, and says so"
+              # The exact string the backend sets on a parked request. No signer
+              # is running in this spec, so this is where the flow stops -- and
+              # that is the property worth asserting: the UI reports where the
+              # decision happens rather than pretending it was sent.
               action: wait_for
-              texts: ["Native transfer submitted"]
+              texts: ["Waiting for approval — open the Signer app"]
               timeout: 30000
               screenshot: "wallet-ui-e2e-send.png"
 
@@ -223,9 +232,21 @@ sections:
             - name: "Refresh history"
               action: click
               target: "Refresh history"
-            - name: "The transaction is in history"
-              action: wait_for
-              texts: ["native", "pending"]
+            - name: "History is empty: nothing was broadcast"
+              # History records a BROADCAST, never a request. Nothing was
+              # approved, so nothing is here -- showing the user a transaction
+              # they had not approved is exactly what this ordering prevents.
+              #
+              # Asserted on `visible`, NOT on the text. findByProperty walks the
+              # whole object tree and ignores visibility, so waiting for
+              # "No transactions yet" would match even with rows present: the
+              # item exists either way. `visible` is bound to
+              # history.length === 0, so it is the part that actually moves.
+              action: expect_property
+              find_by: "objectName"
+              find_value: "historyEmpty"
+              property: "visible"
+              value: true
               timeout: 20000
               text: "A `native` transfer recorded as `pending` — proof the send was built, signed, broadcast, and recorded, all driven through the UI."
               screenshot: "wallet-ui-e2e-history.png"

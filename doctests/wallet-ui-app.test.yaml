@@ -14,7 +14,7 @@ intro: |
   (`QT_QPA_PLATFORM=offscreen`) and drives it through the QML inspector with
   [`logos-qt-mcp`](https://github.com/logos-co/logos-qt-mcp): it waits for the UI
   to come up, **navigates every tab** (Balances → Market → Send → Tokens →
-  History → Private → Settings → Advanced) through the view's `selectTab` helper,
+  History → Settings → Advanced) through the view's `selectTab` helper,
   and on the Settings tab applies a SOCKS5 proxy — a real `set_proxy_config`
   round-trip into the bundled backend that flips the status to **Proxy applied** —
   capturing screenshots along the way.
@@ -70,7 +70,14 @@ sections:
           # runners (--height is exposed by logos-standalone-app). launch_timeout is
           # generous because the app bundle (UI plugin + the whole
           # wallet_backend_module dependency tree) builds during launch.
-          launch: "nix run github:logos-co/logos-evm-wallet-ui{release} --no-write-lock-file -- --height 1000"
+          # --user-dir keeps this run's module state in the doctest workdir.
+          # The standalone app persists module state under the platform
+          # app-data location by default (logos-standalone-app #27), so
+          # without this every run — and the other spec in this suite —
+          # would inherit the previous one's chain config, including mock
+          # RPC endpoints that are already dead. The app then blocks
+          # verifying those endpoints at startup and the UI never appears.
+          launch: "nix run github:logos-co/logos-evm-wallet-ui{release} --no-write-lock-file -- --height 1000 --user-dir ./session"
           qt_mcp: "result-mcp"
           build_timeout: 2400
           launch_timeout: 2400
@@ -127,23 +134,12 @@ sections:
               action: wait_for
               texts: ["Recent activity"]
               timeout: 15000
-            - name: "Switch to the Private tab"
-              action: call_method
-              find_by: "objectName"
-              find_value: "walletRoot"
-              method: "selectTab"
-              args: [5]
-            - name: "Private (RAILGUN) tab rendered"
-              action: wait_for
-              texts: ["Shielded balance"]
-              timeout: 15000
-              screenshot: "wallet-ui-private.png"
             - name: "Switch to the Settings tab"
               action: call_method
               find_by: "objectName"
               find_value: "walletRoot"
               method: "selectTab"
-              args: [6]
+              args: [5]
             - name: "Settings tab rendered"
               action: wait_for
               texts: ["Apply proxy"]
@@ -174,7 +170,7 @@ sections:
               find_by: "objectName"
               find_value: "walletRoot"
               method: "selectTab"
-              args: [7]
+              args: [6]
             - name: "Advanced tab rendered"
               action: wait_for
               texts: ["Custom network"]

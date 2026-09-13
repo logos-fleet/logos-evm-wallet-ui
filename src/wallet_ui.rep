@@ -9,17 +9,15 @@ class WalletUi
     PROP(QString chainsJson READONLY)
     PROP(QString accountsJson READONLY)
     PROP(QString selectedAccount READWRITE)
-    PROP(bool accountUnlocked READONLY)
+    // The id of the signing request awaiting a human in the signer UI,
+    // or "" when nothing is pending. There is no "unlocked" state any
+    // more: the wallet never holds a vault password.
+    PROP(QString pendingRequestId="" READONLY)
     PROP(QString balancesJson READONLY)
     PROP(QString tokensJson READONLY)
     PROP(QString historyJson READONLY)
     PROP(QString marketJson READONLY)
     PROP(QString proxyStatus="" READONLY)
-
-    // Private (RAILGUN) — UNAUDITED upstream, Sepolia-first. The public 0zk
-    // address + shielded balances; spending/viewing keys never reach the UI.
-    PROP(QString zkAddress="" READONLY)
-    PROP(QString shieldedBalanceJson="" READONLY)
 
     // Config / privacy
     SLOT(bool setProxyConfig(QString proxyJson))
@@ -30,8 +28,9 @@ class WalletUi
     SLOT(QString createAccount(QString passphrase, QString label))
     SLOT(QString importMnemonic(QString phraseJson, QString label))
     SLOT(void refreshAccounts())
-    SLOT(bool unlock(QString address, QString passphrase))
-    SLOT(bool lock(QString address))
+    // Poll a signing request the wallet raised. Approval happens in the
+    // signer UI, which is the only surface that takes the password.
+    SLOT(QString sendStatus(QString requestId))
 
     // Balances + tokens
     SLOT(void refreshBalances(QString address))
@@ -48,11 +47,4 @@ class WalletUi
 
     // History
     SLOT(void refreshHistory(QString address))
-
-    // Private (RAILGUN)
-    SLOT(QString initPrivate(QString address, int chainId))
-    SLOT(void syncPrivate())
-    SLOT(void refreshShieldedBalance())
-    SLOT(QString shield(QString sendJson))
-    SLOT(QString privateSend(QString sendJson))
 }
