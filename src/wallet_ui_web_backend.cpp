@@ -1,5 +1,6 @@
 #include "wallet_ui_web_backend.h"
 
+#include <QDebug>
 #include <QJsonDocument>
 #include <QJsonValue>
 
@@ -32,12 +33,16 @@ constexpr int kStartupGiveUpMs = 60000;
 // one rather than hidden inside a poll interval, and it is generous because the
 // thing it is waiting for takes microseconds once the reply has landed.
 //
-// It is also why the first ask RETRIES. A refusal here is a race, not an
-// answer, and a wallet that showed "no accounts" because it asked half a second
-// early would be wrong in the way that is hardest to notice.
-constexpr int kAdmissionSettleMs = 2000;
-constexpr int kAccountRetries = 3;
-constexpr int kAccountRetryMs = 3000;
+// It is also why the first ask RETRIES, and the RETRY is the part that makes
+// this correct: a refusal here is a race, not an answer, and a wallet that
+// showed "no accounts" because it asked half a second early would be wrong in
+// the way that is hardest to notice. Because the retry carries the correctness,
+// the settle only has to cover the common case, so it is short and the retries
+// are close together — six over three seconds rather than one wait of two.
+// A phone's first paint of the account list is the thing being spent here.
+constexpr int kAdmissionSettleMs = 250;
+constexpr int kAccountRetries = 6;
+constexpr int kAccountRetryMs = 500;
 
 // Every rust-first module on this wire answers a JSON TEXT, not a structure,
 // so a reply is parsed before it is read.
@@ -59,6 +64,18 @@ QJsonValue resultOf(const QJsonObject& reply)
 QString errorOf(const QJsonObject& reply)
 {
     return reply.value(QStringLiteral("error")).toString();
+}
+
+// WHAT THIS BACKEND IS DOING, ON THE PAGE'S CONSOLE.
+//
+// A `web` variant's backend is a wasm image inside a page inside a webview:
+// there is no process to attach to, no log file it owns and no property a host
+// can read while it is starting. The container forwards a page's console to the
+// app's log, so that is where this says what it did — and the device is the only
+// place several of these lines have ever been needed.
+void announce(const QString& what)
+{
+    qInfo().noquote() << QStringLiteral("[wallet_ui web] %1").arg(what);
 }
 
 QString jsonText(const QJsonObject& obj)
@@ -85,6 +102,7 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     // user picks or a chain list they change.
     connect(this, &WalletUiWebBackend::selectedAccountChanged, this,
             [this](const QString& address) {
+                announce(QStringLiteral("the view picked %1").arg(address));
                 if (!address.isEmpty())
                     refreshBalances(address);
             });
@@ -120,12 +138,26 @@ void WalletUiWebBackend::startWhenReachable()
     connect(&m_startup, &QTimer::timeout, this, [this]() {
         if (logos::web::hostAdmitted()) {
             m_startup.stop();
+            announce(QStringLiteral("admitted after %1 ms; asking %2 for accounts in %3 ms")
+                         .arg(m_startupTicks * kStartupPollMs)
+                         .arg(kKeystore)
+                         .arg(kAdmissionSettleMs));
             QTimer::singleShot(kAdmissionSettleMs, this,
                                [this]() { refreshAccounts(); });
             return;
         }
-        if (++m_startupTicks * kStartupPollMs > kStartupGiveUpMs) {
+        ++m_startupTicks;
+        // ONCE A SECOND WHILE IT WAITS, and the two flags separately: "the page
+        // has a channel" and "the core has admitted this module" fail for
+        // different reasons and only the second is the one to act on.
+        if (m_startupTicks % (1000 / kStartupPollMs) == 0)
+            announce(QStringLiteral("waiting for admission: channel=%1 admitted=%2 (%3 ms)")
+                         .arg(logos::web::canCallModules() ? "yes" : "no")
+                         .arg(logos::web::hostAdmitted() ? "yes" : "no")
+                         .arg(m_startupTicks * kStartupPollMs));
+        if (m_startupTicks * kStartupPollMs > kStartupGiveUpMs) {
             m_startup.stop();
+            announce(QStringLiteral("NO HOST: never admitted in %1 ms").arg(kStartupGiveUpMs));
             setStatusText(QStringLiteral(
                 "No host: this page was never admitted by a Logos container"));
         }
@@ -280,10 +312,16 @@ QString WalletUiWebBackend::testEndpoint(int chainId)
 
 void WalletUiWebBackend::refreshAccounts()
 {
+    announce(QStringLiteral("refreshAccounts: asking %1, channel=%2 admitted=%3")
+                 .arg(kKeystore)
+                 .arg(logos::web::canCallModules() ? "yes" : "no")
+                 .arg(logos::web::hostAdmitted() ? "yes" : "no"));
     logos::web::callModuleAsync(
         kKeystore, QStringLiteral("list_accounts"), QJsonArray{},
         [this](const logos::web::ModuleCallResult& res) {
             if (!res.ok) {
+                announce(QStringLiteral("keystore_module refused list_accounts: %1")
+                             .arg(res.error));
                 setStatusText(QStringLiteral("keystore_module: %1").arg(res.error));
                 // See kAdmissionSettleMs: a refusal this early is a race with
                 // the core's own load path, not an answer.
@@ -294,10 +332,32 @@ void WalletUiWebBackend::refreshAccounts()
             }
             m_accountRetries = 0;
             const QJsonObject reply = replyOf(res);   // `{ok, accounts:[…]}`
+            const QJsonArray accounts = reply.value(QStringLiteral("accounts")).toArray();
             QJsonObject out;
-            out.insert(QStringLiteral("accounts"),
-                       reply.value(QStringLiteral("accounts")).toArray());
+            out.insert(QStringLiteral("accounts"), accounts);
             setAccountsJson(jsonText(out));
+
+            // AND PICK ONE, HERE, rather than leaving it to the view.
+            //
+            // "Open the app, see what you hold" is the whole of this variant's
+            // job, and it needs an account selected before a balance can be
+            // asked for. The view has an auto-select — WalletView.qml's
+            // `onCountChanged` — and on the device it does not fire for this
+            // path: measured on an iPad Air 13-inch simulator, the accounts
+            // reached the replica and `selectedAccount` stayed empty, so
+            // nothing ever asked eth_rpc anything. A backend that depends on a
+            // view to choose cannot work headless either, and this one is asked
+            // things over the door with no view attached. Only when nothing is
+            // selected, so a user's own pick is never overridden.
+            if (selectedAccount().isEmpty() && !accounts.isEmpty())
+                setSelectedAccount(accounts.first().toString());
+
+            announce(QStringLiteral("accounts: %1 from keystore_module%2")
+                         .arg(accounts.size())
+                         .arg(accounts.isEmpty()
+                                  ? QString()
+                                  : QStringLiteral(", first %1")
+                                        .arg(accounts.first().toString())));
         });
 }
 
@@ -355,6 +415,11 @@ void WalletUiWebBackend::refreshBalances(QString address)
     m_balances = QJsonObject();
     m_balancePending = 0;
     setStatusText(QStringLiteral("Refreshing balances…"));
+    announce(QStringLiteral("refreshBalances(%1): %2 chain(s), channel=%3 admitted=%4")
+                 .arg(address)
+                 .arg(m_chains.size())
+                 .arg(logos::web::canCallModules() ? "yes" : "no")
+                 .arg(logos::web::hostAdmitted() ? "yes" : "no"));
 
     for (const QJsonValue& c : m_chains) {
         const QJsonObject o = c.toObject();
@@ -381,6 +446,11 @@ void WalletUiWebBackend::fetchBalance(const QString& address, int chainId,
             // name — or publish itself half-full. See m_balanceEpoch.
             if (epoch != m_balanceEpoch)
                 return;
+
+            announce(QStringLiteral("get_balance(%1) -> ok=%2 %3")
+                         .arg(chainId)
+                         .arg(res.ok ? "yes" : "no")
+                         .arg(res.ok ? res.value.toString() : res.error));
 
             QJsonObject entry;
             entry.insert(QStringLiteral("chainId"), chainId);
@@ -421,6 +491,8 @@ void WalletUiWebBackend::publishBalances()
     root.insert(QStringLiteral("balances"), inner);
     setBalancesJson(jsonText(root));
     setStatusText(QStringLiteral("Balances updated"));
+    announce(QStringLiteral("published balances: %1")
+                 .arg(QString::fromUtf8(QJsonDocument(inner).toJson(QJsonDocument::Compact))));
 }
 
 // ── everything the coordinator owns ──────────────────────────────────────────
