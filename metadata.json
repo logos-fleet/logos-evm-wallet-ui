@@ -18,6 +18,19 @@
   "codegen": {
     "rep": "src/wallet_ui.rep"
   },
+  "web": {
+    "dependencies": [
+      "eth_rpc_module",
+      "keystore_module"
+    ],
+    "view_backend": {
+      "class": "WalletUiWebBackend",
+      "header": "src/wallet_ui_web_backend.h",
+      "sources": [
+        "src/wallet_ui_web_backend.cpp"
+      ]
+    }
+  },
   "nix": {
     "packages": {
       "build": [],
