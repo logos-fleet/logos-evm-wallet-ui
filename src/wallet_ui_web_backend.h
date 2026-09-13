@@ -1,8 +1,8 @@
 #pragma once
 
-#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QSet>
 #include <QString>
 #include <QTimer>
 
@@ -99,16 +99,23 @@ private:
     // address, because the view asks for one account at a time and a second
     // ask supersedes the first — an image with one event loop has no use for
     // two half-finished aggregates.
-    QString m_balanceAddress;
+    //
+    // The epoch is what makes "supersedes" true. Every ask bumps it and every
+    // reply carries the one it was made under, so a reply from a fan-out that
+    // has been replaced is dropped — including a replacement for the SAME
+    // address, whose stale replies would otherwise decrement the new counter
+    // and publish an aggregate that is still filling.
+    quint64 m_balanceEpoch = 0;
     int m_balancePending = 0;
     QJsonObject m_balances;
 
-    // Whether `eth_rpc_module` has been told about a chain in this page's
-    // lifetime. A `web` variant's page dies with the app, and eth_rpc's config
-    // is the NATIVE module's, so this only avoids re-sending — it is a cache,
-    // never a source of truth.
-    QHash<int, bool> m_chainConfigured;
+    // The chains `eth_rpc_module` has been told about in this page's lifetime.
+    // A `web` variant's page dies with the app, and eth_rpc's config is the
+    // NATIVE module's, so this only avoids re-sending — it is a cache, never a
+    // source of truth, and a chain eth_rpc refused drops back out of it.
+    QSet<int> m_chainsConfigured;
 
+    QJsonObject chainById(int chainId) const;
     void seedDefaultChains();
     void startWhenReachable();
     void ensureChainConfig(int chainId, const QString& endpoint);

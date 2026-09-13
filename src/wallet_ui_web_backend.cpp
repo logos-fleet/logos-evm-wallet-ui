@@ -39,20 +39,26 @@ constexpr int kAdmissionSettleMs = 2000;
 constexpr int kAccountRetries = 3;
 constexpr int kAccountRetryMs = 3000;
 
+// Every rust-first module on this wire answers a JSON TEXT, not a structure,
+// so a reply is parsed before it is read.
+QJsonObject replyOf(const logos::web::ModuleCallResult& res)
+{
+    return QJsonDocument::fromJson(res.value.toString().toUtf8()).object();
+}
+
 // `{ "ok": true, "result": … }` / `{ "ok": false, "error": … }` — eth_rpc's
 // envelope, and the keystore's. Read here rather than in each caller so a
 // refusal is never mistaken for a value.
-QJsonValue resultOf(const QJsonValue& reply)
+QJsonValue resultOf(const QJsonObject& reply)
 {
-    const QJsonObject obj = reply.toObject();
-    if (!obj.value(QStringLiteral("ok")).toBool())
+    if (!reply.value(QStringLiteral("ok")).toBool())
         return QJsonValue();
-    return obj.value(QStringLiteral("result"));
+    return reply.value(QStringLiteral("result"));
 }
 
-QString errorOf(const QJsonValue& reply)
+QString errorOf(const QJsonObject& reply)
 {
-    return reply.toObject().value(QStringLiteral("error")).toString();
+    return reply.value(QStringLiteral("error")).toString();
 }
 
 QString jsonText(const QJsonObject& obj)
@@ -149,6 +155,18 @@ void WalletUiWebBackend::seedDefaultChains()
     };
 }
 
+// The seeded (or `setChains`-supplied) entry for a chain, empty when this
+// variant does not know it.
+QJsonObject WalletUiWebBackend::chainById(int chainId) const
+{
+    for (const QJsonValue& c : m_chains) {
+        const QJsonObject o = c.toObject();
+        if (o.value(QStringLiteral("chainId")).toInt() == chainId)
+            return o;
+    }
+    return {};
+}
+
 void WalletUiWebBackend::publishChains()
 {
     QJsonObject root;
@@ -172,9 +190,9 @@ QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 
 void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint)
 {
-    if (m_chainConfigured.value(chainId, false) || endpoint.isEmpty())
+    if (m_chainsConfigured.contains(chainId) || endpoint.isEmpty())
         return;
-    m_chainConfigured.insert(chainId, true);
+    m_chainsConfigured.insert(chainId);
 
     QJsonObject cfg;
     cfg.insert(QStringLiteral("endpoint"), endpoint);
@@ -187,7 +205,7 @@ void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint)
             // clear the mark or every later balance on this chain would be
             // asked of an endpoint eth_rpc was never told about.
             if (!res.ok || !res.value.toBool()) {
-                m_chainConfigured.insert(chainId, false);
+                m_chainsConfigured.remove(chainId);
                 setStatusText(QStringLiteral("eth_rpc_module refused chain %1: %2")
                                   .arg(chainId)
                                   .arg(res.ok ? QStringLiteral("bad config")
@@ -206,17 +224,18 @@ bool WalletUiWebBackend::setProxyConfig(QString proxyJson)
 
 bool WalletUiWebBackend::setChains(QString chainsJson)
 {
-    const QJsonObject root = QJsonDocument::fromJson(chainsJson.toUtf8()).object();
-    const QJsonValue chains = root.value(QStringLiteral("chains"));
-    const QJsonArray list = chains.isArray() ? chains.toArray()
-                                             : QJsonDocument::fromJson(
-                                                   chainsJson.toUtf8()).array();
+    // Either shape the view may send: the wrapped `{"chains":[…]}` this
+    // backend publishes, or a bare list.
+    const QJsonDocument doc = QJsonDocument::fromJson(chainsJson.toUtf8());
+    const QJsonArray list = doc.isArray()
+        ? doc.array()
+        : doc.object().value(QStringLiteral("chains")).toArray();
     if (list.isEmpty()) {
         setStatusText(QStringLiteral("Set chains failed: no chains in the list"));
         return false;
     }
     m_chains = list;
-    m_chainConfigured.clear();
+    m_chainsConfigured.clear();
     publishChains();
     for (const QJsonValue& c : m_chains) {
         const QJsonObject o = c.toObject();
@@ -234,13 +253,8 @@ bool WalletUiWebBackend::setChains(QString chainsJson)
 // so is better than blocking an event loop that would never be pumped.
 QString WalletUiWebBackend::testEndpoint(int chainId)
 {
-    const QJsonObject chain = [&]() -> QJsonObject {
-        for (const QJsonValue& c : m_chains)
-            if (c.toObject().value(QStringLiteral("chainId")).toInt() == chainId)
-                return c.toObject();
-        return {};
-    }();
-    ensureChainConfig(chainId, chain.value(QStringLiteral("rpcUrl")).toString());
+    ensureChainConfig(chainId,
+                      chainById(chainId).value(QStringLiteral("rpcUrl")).toString());
 
     setStatusText(QStringLiteral("Testing chain %1…").arg(chainId));
     logos::web::callModuleAsync(
@@ -250,8 +264,7 @@ QString WalletUiWebBackend::testEndpoint(int chainId)
                 setStatusText(QStringLiteral("chain %1: %2").arg(chainId).arg(res.error));
                 return;
             }
-            const QJsonValue reply =
-                QJsonDocument::fromJson(res.value.toString().toUtf8()).object();
+            const QJsonObject reply = replyOf(res);
             const QJsonValue got = resultOf(reply);
             setStatusText(got.isNull()
                               ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
@@ -280,10 +293,7 @@ void WalletUiWebBackend::refreshAccounts()
                 return;
             }
             m_accountRetries = 0;
-            // The keystore answers a JSON TEXT, as every rust-first module on
-            // this wire does; `{ok, accounts:[…]}` once parsed.
-            const QJsonObject reply =
-                QJsonDocument::fromJson(res.value.toString().toUtf8()).object();
+            const QJsonObject reply = replyOf(res);   // `{ok, accounts:[…]}`
             QJsonObject out;
             out.insert(QStringLiteral("accounts"),
                        reply.value(QStringLiteral("accounts")).toArray());
@@ -355,7 +365,7 @@ void WalletUiWebBackend::refreshBalances(QString address)
         setStatusText(QStringLiteral("Pick an account first"));
         return;
     }
-    m_balanceAddress = address;
+    ++m_balanceEpoch;
     m_balances = QJsonObject();
     m_balancePending = 0;
     setStatusText(QStringLiteral("Refreshing balances…"));
@@ -375,13 +385,15 @@ void WalletUiWebBackend::refreshBalances(QString address)
 void WalletUiWebBackend::fetchBalance(const QString& address, int chainId,
                                       const QString& symbol)
 {
+    const quint64 epoch = m_balanceEpoch;
     logos::web::callModuleAsync(
         kEthRpc, QStringLiteral("get_balance"), QJsonArray{ chainId, address },
-        [this, address, chainId, symbol](const logos::web::ModuleCallResult& res) {
-            // A SECOND ASK SUPERSEDES THE FIRST. A reply for an address the
-            // view has moved on from is dropped rather than merged, or the
-            // aggregate would carry two accounts' balances under one name.
-            if (address != m_balanceAddress)
+        [this, epoch, chainId, symbol](const logos::web::ModuleCallResult& res) {
+            // A SECOND ASK SUPERSEDES THE FIRST. A reply belonging to a
+            // fan-out that has been replaced is dropped rather than merged,
+            // or the aggregate would carry two accounts' balances under one
+            // name — or publish itself half-full. See m_balanceEpoch.
+            if (epoch != m_balanceEpoch)
                 return;
 
             QJsonObject entry;
@@ -390,8 +402,7 @@ void WalletUiWebBackend::fetchBalance(const QString& address, int chainId,
                 entry.insert(QStringLiteral("native"),
                              QStringLiteral("unavailable (%1)").arg(res.error));
             } else {
-                const QJsonObject reply =
-                    QJsonDocument::fromJson(res.value.toString().toUtf8()).object();
+                const QJsonObject reply = replyOf(res);
                 const QJsonValue wei = resultOf(reply);
                 entry.insert(QStringLiteral("native"),
                              wei.isString()
