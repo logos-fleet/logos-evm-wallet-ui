@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
 #include <QString>
@@ -134,6 +135,18 @@ private:
     // reports eth_rpc's own error, which is worth more than silence.
     void ensureChainConfig(int chainId, const QString& endpoint,
                            std::function<void()> then = {});
+
+    // Name this module a custodian on the keystore, then run `then`. The same
+    // chained shape as ensureChainConfig and for the same reason: the role has to
+    // be IN FORCE before the mutation is asked for, and two calls issued in one
+    // turn are answered in whatever order the container finishes them. `then`
+    // runs only when the role was taken â a refusal here means the mutation would
+    // be refused too, and saying so once is better than saying it twice.
+    void claimCustody(std::function<void()> then);
+    // The second link of that chain: the `configure` call itself. Split out so
+    // claimCustody reads as the two questions it asks — "who am I here?" and
+    // "may I mutate?" — rather than as two nested lambdas.
+    void takeCustodianRole(std::function<void()> then);
 
     // The two things a configured chain is asked, and the only two continuations
     // ensureChainConfig is ever given.

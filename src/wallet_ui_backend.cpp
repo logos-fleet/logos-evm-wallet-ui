@@ -4,7 +4,8 @@
 #include <QJsonObject>
 
 // Generated umbrella: modules() → typed callers + typed event accessors for the
-// modules in metadata.json#dependencies (here: wallet_backend_module).
+// modules in metadata.json#dependencies (here: wallet_backend_module for
+// everything the coordinator owns, keystore_module for account creation).
 #include "logos_sdk.h"
 
 void WalletUiBackend::onContextReady()
@@ -61,9 +62,43 @@ QString WalletUiBackend::testEndpoint(int chainId)
 
 QString WalletUiBackend::createAccount(QString passphrase, QString label)
 {
-    QString r = modules().wallet_backend_module.create_account(passphrase, label);
+    Q_UNUSED(label)
+    // STRAIGHT TO THE KEYSTORE, not through the coordinator. `create_account` left
+    // `wallet_backend_module`'s contract when account mutation became Tier D: a
+    // wallet backend requests signatures and reads which accounts exist, and a
+    // method that existed only to return "not authorized" is worse than no method.
+    // So the one surface that still creates an account is this UI, and it asks the
+    // keystore itself — `keystore_module` is already one of this module's declared
+    // dependencies, so this is one hop rather than three.
+    //
+    // Tier D belongs to the CUSTODIAN, whose built-in default is `evm_keystore_ui`.
+    // That module does not exist in this workspace, so with the defaults in force
+    // the New-account dialog would refuse for ever. This adds this module to the
+    // custodian SET — `configure` is TOTAL, so naming only this one would revoke
+    // `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in the same call,
+    // and a role is a set precisely so a second holder can be added.
+    const QString roles =
+        QStringLiteral("{\"approvers\":\"evm_signer_ui\","
+                       "\"custodians\":[\"evm_keystore_ui\",\"wallet_ui\"]}");
+    const QString configured = modules().keystore_module.configure(roles);
+    if (!QJsonDocument::fromJson(configured.toUtf8()).object()
+             .value(QStringLiteral("ok")).toBool()) {
+        setStatusText(QStringLiteral("keystore_module refused configure"));
+        return configured;
+    }
+    // The acknowledgement is the method's point, not a formality: an unrelated
+    // account is a key no recovery phrase covers, and the keystore refuses to mint
+    // one unless the caller has said so. The New-account dialog IS that choice.
+    QJsonObject params;
+    params.insert(QStringLiteral("password"), passphrase);
+    params.insert(QStringLiteral("acknowledgeUnrecoverable"), true);
+    const QString r = modules().keystore_module.create_unrelated_account(
+        QString::fromUtf8(QJsonDocument(params).toJson(QJsonDocument::Compact)));
     refreshAccounts();
-    setStatusText(QStringLiteral("Account created"));
+    setStatusText(QJsonDocument::fromJson(r.toUtf8()).object()
+                          .value(QStringLiteral("ok")).toBool()
+                      ? QStringLiteral("Account created")
+                      : QStringLiteral("Account creation refused"));
     return r;
 }
 

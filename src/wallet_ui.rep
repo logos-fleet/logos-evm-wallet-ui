@@ -25,6 +25,10 @@ class WalletUi
     SLOT(QString testEndpoint(int chainId))
 
     // Accounts (signing stays in the keystore module)
+    // `createAccount` mints an UNRELATED account: a key no recovery phrase
+    // covers. It is the only kind this wallet can make, because it holds no
+    // seed — `keystore_module.create_unrelated_account`, which is Tier D and
+    // therefore needs this module named a custodian first.
     SLOT(QString createAccount(QString passphrase, QString label))
     SLOT(QString importMnemonic(QString phraseJson, QString label))
     SLOT(void refreshAccounts())
