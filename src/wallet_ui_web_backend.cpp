@@ -240,10 +240,14 @@ QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 
 // ── config ───────────────────────────────────────────────────────────────────
 
-void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint)
+void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint,
+                                           std::function<void()> then)
 {
-    if (m_chainsConfigured.contains(chainId) || endpoint.isEmpty())
+    if (m_chainsConfigured.contains(chainId) || endpoint.isEmpty()) {
+        if (then)
+            then();
         return;
+    }
     m_chainsConfigured.insert(chainId);
 
     QJsonObject cfg;
@@ -251,18 +255,26 @@ void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint)
     logos::web::callModuleAsync(
         kEthRpc, QStringLiteral("set_chain_config"),
         QJsonArray{ chainId, jsonText(cfg) },
-        [this, chainId](const logos::web::ModuleCallResult& res) {
+        [this, chainId, then](const logos::web::ModuleCallResult& res) {
             // A REFUSAL IS NOT CACHED. set_chain_config answers a bare bool, so
             // a `false` — or a call that never reached the module — has to
             // clear the mark or every later balance on this chain would be
             // asked of an endpoint eth_rpc was never told about.
             if (!res.ok || !res.value.toBool()) {
                 m_chainsConfigured.remove(chainId);
+                const QString why = res.ok ? QStringLiteral("bad config") : res.error;
+                announce(QStringLiteral("eth_rpc_module refused chain %1: %2")
+                             .arg(chainId).arg(why));
                 setStatusText(QStringLiteral("eth_rpc_module refused chain %1: %2")
-                                  .arg(chainId)
-                                  .arg(res.ok ? QStringLiteral("bad config")
-                                              : res.error));
+                                  .arg(chainId).arg(why));
+            } else {
+                announce(QStringLiteral("eth_rpc_module configured chain %1").arg(chainId));
             }
+            // ALWAYS, and always last: the caller's next step is a question
+            // ABOUT this chain, and a refusal answered by eth_rpc in its own
+            // words beats a balance that silently never went out.
+            if (then)
+                then();
         });
 }
 
@@ -305,22 +317,25 @@ bool WalletUiWebBackend::setChains(QString chainsJson)
 // so is better than blocking an event loop that would never be pumped.
 QString WalletUiWebBackend::testEndpoint(int chainId)
 {
-    ensureChainConfig(chainId,
-                      chainById(chainId).value(QStringLiteral("rpcUrl")).toString());
-
     setStatusText(QStringLiteral("Testing chain %1…").arg(chainId));
-    logos::web::callModuleAsync(
-        kEthRpc, QStringLiteral("verify_chain_id"), QJsonArray{ chainId },
-        [this, chainId](const logos::web::ModuleCallResult& res) {
-            if (!res.ok) {
-                setStatusText(QStringLiteral("chain %1: %2").arg(chainId).arg(res.error));
-                return;
-            }
-            const QJsonObject reply = replyOf(res);
-            const QJsonValue got = resultOf(reply);
-            setStatusText(got.isNull()
-                              ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
-                              : QStringLiteral("chain %1 answered").arg(chainId));
+    // Same sequence as a balance, for the same reason: the endpoint has to be
+    // in eth_rpc before it is asked to reach it.
+    ensureChainConfig(
+        chainId, chainById(chainId).value(QStringLiteral("rpcUrl")).toString(),
+        [this, chainId]() {
+            logos::web::callModuleAsync(
+                kEthRpc, QStringLiteral("verify_chain_id"), QJsonArray{ chainId },
+                [this, chainId](const logos::web::ModuleCallResult& res) {
+                    if (!res.ok) {
+                        setStatusText(QStringLiteral("chain %1: %2").arg(chainId).arg(res.error));
+                        return;
+                    }
+                    const QJsonObject reply = replyOf(res);
+                    const QJsonValue got = resultOf(reply);
+                    setStatusText(got.isNull()
+                                      ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
+                                      : QStringLiteral("chain %1 answered").arg(chainId));
+                });
         });
     return accepted();
 }
@@ -422,9 +437,13 @@ void WalletUiWebBackend::refreshBalances(QString address)
         setStatusText(QStringLiteral("Pick an account first"));
         return;
     }
-    ++m_balanceEpoch;
+    const quint64 epoch = ++m_balanceEpoch;
     m_balances = QJsonObject();
-    m_balancePending = 0;
+    // COUNTED IN FULL BEFORE ANY CALL GOES OUT. A chain whose configuration is
+    // already in place runs its continuation inline, so incrementing as we go
+    // would let the first reply find a counter of 1 and publish an aggregate
+    // that is still filling.
+    m_balancePending = m_chains.size();
     setStatusText(QStringLiteral("Refreshing balances…"));
     announce(QStringLiteral("refreshBalances(%1): %2 chain(s), %3")
                  .arg(address)
@@ -434,10 +453,19 @@ void WalletUiWebBackend::refreshBalances(QString address)
     for (const QJsonValue& c : m_chains) {
         const QJsonObject o = c.toObject();
         const int chainId = o.value(QStringLiteral("chainId")).toInt();
-        ensureChainConfig(chainId, o.value(QStringLiteral("rpcUrl")).toString());
-        ++m_balancePending;
-        fetchBalance(address, chainId,
-                     o.value(QStringLiteral("nativeSymbol")).toString());
+        const QString symbol = o.value(QStringLiteral("nativeSymbol")).toString();
+        // CONFIGURE, THEN ASK — see ensureChainConfig's note. Issuing both in
+        // one turn is what made every balance read
+        // "unavailable (no configuration for chain 1)" on the device.
+        ensureChainConfig(
+            chainId, o.value(QStringLiteral("rpcUrl")).toString(),
+            [this, epoch, address, chainId, symbol]() {
+                // A fan-out that has been superseded does not get to spend a
+                // call: the counter it would decrement belongs to the new one.
+                if (epoch != m_balanceEpoch)
+                    return;
+                fetchBalance(address, chainId, symbol);
+            });
     }
     if (m_balancePending == 0)
         publishBalances();

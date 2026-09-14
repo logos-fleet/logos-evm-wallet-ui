@@ -6,6 +6,8 @@
 #include <QString>
 #include <QTimer>
 
+#include <functional>
+
 #include "rep_wallet_ui_source.h"
 
 // THE WALLET UI'S `web` VARIANT BACKEND — the same `.rep`, the same QML, a
@@ -114,7 +116,24 @@ private:
     QJsonObject chainById(int chainId) const;
     void seedDefaultChains();
     void startWhenReachable();
-    void ensureChainConfig(int chainId, const QString& endpoint);
+
+    // Configure a chain on eth_rpc, then run `then` — and the CONTINUATION is
+    // the point. Two calls made in the same turn are delivered in order and
+    // answered in whatever order the container finishes them, because a call to
+    // an in-process Bare target spins a nested event loop inside the capability
+    // handshake, which runs the NEXT queued call to completion first. Measured
+    // on an iPad Air 13-inch simulator: `set_chain_config(1, …)` and
+    // `get_balance(1, …)` issued together, and the balance answered
+    // `{"ok":false,"error":"no configuration for chain 1"}` — the endpoint
+    // landed after the question that needed it. logos_web_module_call.h states
+    // the rule ("a backend that needs a sequence chains it in the callbacks");
+    // this is that chain.
+    //
+    // `then` runs exactly once, whether the configuration was already in place,
+    // succeeded, or was refused: a balance asked of an unconfigured chain
+    // reports eth_rpc's own error, which is worth more than silence.
+    void ensureChainConfig(int chainId, const QString& endpoint,
+                           std::function<void()> then = {});
     void fetchBalance(const QString& address, int chainId, const QString& symbol);
     void publishBalances();
     void publishChains();
