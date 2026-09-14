@@ -464,8 +464,19 @@ Loads the locally-recorded, wallet-originated transactions for an account.
 ## The QML view (`qml/WalletView.qml`) and the tab structure
 
 The root is an `Item { objectName: "walletRoot"; width: 460; height: 760 }`. It obtains the
-backend replica with `readonly property var backend: logos.module("wallet_ui")` and tracks
-readiness via `logos.isViewModuleReady("wallet_ui")` / `onViewModuleReadyChanged`.
+backend replica through `takeBackend(trigger)`, which calls `logos.module("wallet_ui")` and reads
+`logos.isViewModuleReady("wallet_ui")` together, and is run from `Component.onCompleted` **and
+again on every `onViewModuleReadyChanged` for this module**.
+
+`backend` is therefore a plain `property var backend: null`, not a binding. `logos.module()` is
+a call rather than a property, so `readonly property var backend: logos.module("wallet_ui")`
+evaluates once and never again — harmless on the desktop, where `LogosQmlBridge` hands back the
+typed replica immediately, and fatal inside the Web container, where `LogosWebBridge` answers
+`null` until the backend's source metadata has crossed the MessagePort. The `web` variant then
+renders its empty state for ever against a perfectly healthy backend
+(logos-workspace#112). `takeBackend` also logs the two halves separately —
+`replica=present|NULL viewModuleReady=true|false` — because a missing replica and a missing
+readiness signal both render as the same amber banner.
 
 ### Shared chrome (always visible, above/below the tabs)
 

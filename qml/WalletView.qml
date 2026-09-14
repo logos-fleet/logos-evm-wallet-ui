@@ -24,7 +24,27 @@ Item {
     width: 460
     height: 760
 
-    readonly property var backend: logos.module("wallet_ui")
+    // THE BACKEND, TAKEN ON AN EDGE — not bound once.
+    //
+    // `logos.module()` is a CALL, not a property, so a binding written
+    // `readonly property var backend: logos.module("wallet_ui")` is evaluated
+    // once and has no dependency to re-evaluate on. On the desktop that is
+    // invisible: LogosQmlBridge hands back the module's TYPED replica
+    // immediately, so the one evaluation captures it. Inside the Web container
+    // LogosWebBridge answers NULL until the backend's source metadata has
+    // crossed the MessagePort — a dynamic replica given to QML before then is
+    // cached with the generic QRemoteObjectReplica metaobject for the life of
+    // the page, which is a far worse failure than a view that waits — so the
+    // one evaluation captured null and kept it.
+    //
+    // That is the whole of logos-workspace#112: the `web` variant's backend
+    // fetched an account, selected it and published balances while the view
+    // sat on "Connecting to backend…" with `backend === null`.
+    //
+    // So the view does what both bridges' shared contract asks: call once to
+    // START the acquire, and take the answer again on viewModuleReadyChanged.
+    // Unchanged on the desktop, where the first call already answers.
+    property var backend: null
     property bool ready: false
     // When a custom network is saved/selected on the Advanced tab, sends target it
     // directly (so a freshly-added local node is usable without touching the Send
@@ -67,13 +87,34 @@ Item {
     // Switching the tab makes that page's controls visible/findable to qt-mcp.
     function selectTab(i) { tabs.currentIndex = Number(i) }
 
+    // Take (or re-take) the backend, and SAY WHICH HALF IS MISSING.
+    //
+    // "the replica is null" and "the ready edge never came" are two different
+    // faults that render as the same amber banner, and #112 spent a whole
+    // device session unable to tell them apart. They are reported separately
+    // here, on the page's console — which the Web container forwards to the
+    // app's log, and which on a phone is the only window into a canvas.
+    function takeBackend(trigger) {
+        var replica = logos.module("wallet_ui")
+        var viewModuleReady = logos.isViewModuleReady("wallet_ui")
+        root.backend = replica
+        root.ready = replica !== null && viewModuleReady
+        console.log("wallet_ui view: " + trigger
+                    + " -- replica=" + (replica !== null ? "present" : "NULL")
+                    + " viewModuleReady=" + viewModuleReady
+                    + " -> ready=" + root.ready)
+    }
+
     Connections {
         target: logos
         function onViewModuleReadyChanged(moduleName, isReady) {
-            if (moduleName === "wallet_ui") root.ready = isReady && root.backend !== null
+            if (moduleName === "wallet_ui")
+                root.takeBackend("viewModuleReadyChanged(" + isReady + ")")
         }
     }
-    Component.onCompleted: root.ready = root.backend !== null && logos.isViewModuleReady("wallet_ui")
+    // The early call is not wasted even when it answers null: it is what puts
+    // the replica on the node and starts the acquire in the first place.
+    Component.onCompleted: root.takeBackend("Component.onCompleted")
 
     // Themed background.
     Rectangle {
