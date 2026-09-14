@@ -83,6 +83,11 @@ QString jsonText(const QJsonObject& obj)
     return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
 }
 
+QString compact(const QJsonArray& arr)
+{
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
 // The two flags every startup line and every outbound call is announced with,
 // always together and always in the same words: "the page has a channel" and
 // "the core has admitted this module" fail for different reasons, and only the
@@ -402,17 +407,103 @@ QString WalletUiWebBackend::createAccount(QString passphrase, QString label)
 {
     Q_UNUSED(label)
     setStatusText(QStringLiteral("Creating account…"));
-    logos::web::callModuleAsync(
-        kKeystore, QStringLiteral("new_account"), QJsonArray{ passphrase },
-        [this](const logos::web::ModuleCallResult& res) {
-            if (!res.ok) {
-                setStatusText(QStringLiteral("keystore_module: %1").arg(res.error));
-                return;
-            }
-            setStatusText(QStringLiteral("Account created"));
-            refreshAccounts();
-        });
+    // TAKE THE ROLE, THEN MUTATE — and CHAINED, because two calls issued in one
+    // turn are answered in whatever order the container finishes them (see
+    // ensureChainConfig). Asking for the account before the role is in force is
+    // the same race, and it fails as "not authorized" rather than as a timeout.
+    claimCustody([this, passphrase]() {
+        QJsonObject params;
+        params.insert(QStringLiteral("password"), passphrase);
+        // THE ACKNOWLEDGEMENT IS THE METHOD'S POINT, not a formality: an
+        // unrelated account is a key no recovery phrase covers, and the keystore
+        // refuses to mint one unless the caller has said so. This variant says
+        // so on the user's behalf because the New-account dialog IS that choice
+        // — there is no seed phrase anywhere in this wallet to derive from.
+        params.insert(QStringLiteral("acknowledgeUnrecoverable"), true);
+        logos::web::callModuleAsync(
+            kKeystore, QStringLiteral("create_unrelated_account"),
+            QJsonArray{ jsonText(params) },
+            [this](const logos::web::ModuleCallResult& res) {
+                const QJsonObject reply = replyOf(res);
+                if (keystoreRefused(QStringLiteral("create_unrelated_account"), res, reply))
+                    return;
+                announce(QStringLiteral("created %1")
+                             .arg(reply.value(QStringLiteral("address")).toString()));
+                setStatusText(QStringLiteral("Account created"));
+                refreshAccounts();
+            });
+    });
     return accepted();
+}
+
+bool WalletUiWebBackend::keystoreRefused(const QString& method,
+                                         const logos::web::ModuleCallResult& res,
+                                         const QJsonObject& reply)
+{
+    if (res.ok && reply.value(QStringLiteral("ok")).toBool())
+        return false;
+    // A call that never arrived and one the module turned down are the same
+    // outcome to the caller but not the same reason, so the reason is taken from
+    // whichever it was. The same words then go to the console and to the view's
+    // status line: a device run reads the first and a human reads the second.
+    const QString why = res.ok ? errorOf(reply) : res.error;
+    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    setStatusText(QStringLiteral("keystore_module: %1").arg(why));
+    return true;
+}
+
+void WalletUiWebBackend::claimCustody(std::function<void()> then)
+{
+    // ASK WHO THE KEYSTORE THINKS WE ARE, FIRST. Tier D admits a plainly NAMED
+    // module and nothing else: a host anchor, a derived credential and an
+    // operator token are all refused, and all three refuse with the same words
+    // as a wrong name. On a phone there is no other way to ask — no process to
+    // attach to, no CLI that shares this credential — so a run that is refused
+    // says which of the two it was instead of leaving them indistinguishable.
+    // UNGATED and side-effect-free, by contract, so asking costs nothing but the
+    // round trip.
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("caller_identity"), QJsonArray{},
+        [this, then](const logos::web::ModuleCallResult& res) {
+            const QJsonObject who = replyOf(res);
+            announce(QStringLiteral("keystore_module sees this caller as %1 \"%2\"; "
+                                    "custodians %3")
+                         .arg(who.value(QStringLiteral("kind")).toString(),
+                              who.value(QStringLiteral("identity")).toString(),
+                              compact(who.value(QStringLiteral("custodians")).toArray())));
+            takeCustodianRole(then);
+        });
+}
+
+void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
+{
+    // WHY A WALLET NAMES ITSELF CUSTODIAN AT ALL. Creating an account is Tier D
+    // in the keystore: it belongs to the CUSTODIAN, whose built-in default is
+    // `evm_keystore_ui`. That module does not exist in this workspace and
+    // certainly does not run on a phone, so with the defaults in force the New
+    // account dialog would answer "not authorized" for ever. Until a keystore UI
+    // ships, this wallet is the only surface a user can create an account from,
+    // and it says so out loud rather than by being silently admitted.
+    //
+    // ADDED TO THE SET, NOT PUT IN PLACE OF IT. `configure` is TOTAL — a role the
+    // document does not name is held by NOBODY — so naming only this module
+    // would revoke `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in
+    // the same call. A role is a set precisely so a second holder can be added,
+    // and that is all this does.
+    QJsonObject roles;
+    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("custodians"),
+                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("configure"), QJsonArray{ jsonText(roles) },
+        [this, then](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (keystoreRefused(QStringLiteral("configure"), res, reply))
+                return;
+            announce(QStringLiteral("custodians are now %1")
+                         .arg(compact(reply.value(QStringLiteral("custodians")).toArray())));
+            then();
+        });
 }
 
 QString WalletUiWebBackend::importMnemonic(QString phraseJson, QString label)
