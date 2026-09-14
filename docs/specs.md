@@ -464,7 +464,7 @@ Loads the locally-recorded, wallet-originated transactions for an account.
 ## The QML view (`qml/WalletView.qml`) and the tab structure
 
 The root is an `Item { objectName: "walletRoot"; width: 460; height: 760 }`. It obtains the
-backend replica through `takeBackend(why)`, which calls `logos.module("wallet_ui")` and reads
+backend replica through `takeBackend(trigger)`, which calls `logos.module("wallet_ui")` and reads
 `logos.isViewModuleReady("wallet_ui")` together, and is run from `Component.onCompleted` **and
 again on every `onViewModuleReadyChanged` for this module**.
 

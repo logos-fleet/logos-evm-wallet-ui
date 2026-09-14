@@ -263,10 +263,12 @@ void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint,
             if (!res.ok || !res.value.toBool()) {
                 m_chainsConfigured.remove(chainId);
                 const QString why = res.ok ? QStringLiteral("bad config") : res.error;
-                announce(QStringLiteral("eth_rpc_module refused chain %1: %2")
-                             .arg(chainId).arg(why));
-                setStatusText(QStringLiteral("eth_rpc_module refused chain %1: %2")
-                                  .arg(chainId).arg(why));
+                // The same words on the console and in the view's status line:
+                // a device run reads the first and a human reads the second.
+                const QString refusal = QStringLiteral("eth_rpc_module refused chain %1: %2")
+                                            .arg(chainId).arg(why);
+                announce(refusal);
+                setStatusText(refusal);
             } else {
                 announce(QStringLiteral("eth_rpc_module configured chain %1").arg(chainId));
             }
@@ -318,26 +320,32 @@ bool WalletUiWebBackend::setChains(QString chainsJson)
 QString WalletUiWebBackend::testEndpoint(int chainId)
 {
     setStatusText(QStringLiteral("Testing chain %1…").arg(chainId));
-    // Same sequence as a balance, for the same reason: the endpoint has to be
-    // in eth_rpc before it is asked to reach it.
-    ensureChainConfig(
-        chainId, chainById(chainId).value(QStringLiteral("rpcUrl")).toString(),
-        [this, chainId]() {
-            logos::web::callModuleAsync(
-                kEthRpc, QStringLiteral("verify_chain_id"), QJsonArray{ chainId },
-                [this, chainId](const logos::web::ModuleCallResult& res) {
-                    if (!res.ok) {
-                        setStatusText(QStringLiteral("chain %1: %2").arg(chainId).arg(res.error));
-                        return;
-                    }
-                    const QJsonObject reply = replyOf(res);
-                    const QJsonValue got = resultOf(reply);
-                    setStatusText(got.isNull()
-                                      ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
-                                      : QStringLiteral("chain %1 answered").arg(chainId));
-                });
-        });
+    // CONFIGURE, THEN ASK — the same two steps a balance takes, for the same
+    // reason: the endpoint has to be in eth_rpc before it is asked to reach it.
+    ensureChainConfig(chainId,
+                      chainById(chainId).value(QStringLiteral("rpcUrl")).toString(),
+                      [this, chainId]() { verifyChain(chainId); });
     return accepted();
+}
+
+// The second half of testEndpoint, a named function rather than a lambda inside
+// a lambda — so the configure/ask pair reads the same here as it does in
+// refreshBalances, where the continuation is `fetchBalance`.
+void WalletUiWebBackend::verifyChain(int chainId)
+{
+    logos::web::callModuleAsync(
+        kEthRpc, QStringLiteral("verify_chain_id"), QJsonArray{ chainId },
+        [this, chainId](const logos::web::ModuleCallResult& res) {
+            if (!res.ok) {
+                setStatusText(QStringLiteral("chain %1: %2").arg(chainId).arg(res.error));
+                return;
+            }
+            const QJsonObject reply = replyOf(res);
+            const QJsonValue got = resultOf(reply);
+            setStatusText(got.isNull()
+                              ? QStringLiteral("chain %1: %2").arg(chainId).arg(errorOf(reply))
+                              : QStringLiteral("chain %1 answered").arg(chainId));
+        });
 }
 
 // ── accounts: keystore_module ────────────────────────────────────────────────
@@ -439,10 +447,12 @@ void WalletUiWebBackend::refreshBalances(QString address)
     }
     const quint64 epoch = ++m_balanceEpoch;
     m_balances = QJsonObject();
-    // COUNTED IN FULL BEFORE ANY CALL GOES OUT. A chain whose configuration is
-    // already in place runs its continuation inline, so incrementing as we go
-    // would let the first reply find a counter of 1 and publish an aggregate
-    // that is still filling.
+    // COUNTED IN FULL BEFORE ANY CALL GOES OUT, because the chains no longer
+    // start their calls together: one already configured fetches from inside
+    // this loop, one not yet configured fetches from a later turn. Counting a
+    // chain in as its fetch is issued would let the first chain's reply find a
+    // counter of 1, drop it to 0 and publish an aggregate still missing every
+    // chain whose configuration had not answered yet.
     m_balancePending = m_chains.size();
     setStatusText(QStringLiteral("Refreshing balances…"));
     announce(QStringLiteral("refreshBalances(%1): %2 chain(s), %3")

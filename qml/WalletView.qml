@@ -94,14 +94,14 @@ Item {
     // device session unable to tell them apart. They are reported separately
     // here, on the page's console — which the Web container forwards to the
     // app's log, and which on a phone is the only window into a canvas.
-    function takeBackend(why) {
+    function takeBackend(trigger) {
         var replica = logos.module("wallet_ui")
-        var signalled = logos.isViewModuleReady("wallet_ui")
+        var viewModuleReady = logos.isViewModuleReady("wallet_ui")
         root.backend = replica
-        root.ready = replica !== null && signalled
-        console.log("wallet_ui view: " + why
+        root.ready = replica !== null && viewModuleReady
+        console.log("wallet_ui view: " + trigger
                     + " -- replica=" + (replica !== null ? "present" : "NULL")
-                    + " viewModuleReady=" + signalled
+                    + " viewModuleReady=" + viewModuleReady
                     + " -> ready=" + root.ready)
     }
 

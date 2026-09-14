@@ -134,6 +134,10 @@ private:
     // reports eth_rpc's own error, which is worth more than silence.
     void ensureChainConfig(int chainId, const QString& endpoint,
                            std::function<void()> then = {});
+
+    // The two things a configured chain is asked, and the only two continuations
+    // ensureChainConfig is ever given.
+    void verifyChain(int chainId);
     void fetchBalance(const QString& address, int chainId, const QString& symbol);
     void publishBalances();
     void publishChains();
