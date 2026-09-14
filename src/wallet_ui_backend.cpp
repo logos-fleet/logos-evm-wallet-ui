@@ -1,5 +1,6 @@
 #include "wallet_ui_backend.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -7,6 +8,27 @@
 // modules in metadata.json#dependencies (here: wallet_backend_module for
 // everything the coordinator owns, keystore_module for account creation).
 #include "logos_sdk.h"
+
+namespace {
+
+QString jsonText(const QJsonObject& obj)
+{
+    return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+// Every rust-first module on this wire answers a JSON TEXT, not a structure, so
+// a reply is parsed before it is read: `{ "ok": true, … }` on success and
+// `{ "ok": false, "error": … }` on a refusal. Named as in the web variant, which
+// reads the same envelope.
+bool replyOk(const QString& replyJson)
+{
+    return QJsonDocument::fromJson(replyJson.toUtf8())
+        .object()
+        .value(QStringLiteral("ok"))
+        .toBool();
+}
+
+} // namespace
 
 void WalletUiBackend::onContextReady()
 {
@@ -77,12 +99,12 @@ QString WalletUiBackend::createAccount(QString passphrase, QString label)
     // custodian SET — `configure` is TOTAL, so naming only this one would revoke
     // `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in the same call,
     // and a role is a set precisely so a second holder can be added.
-    const QString roles =
-        QStringLiteral("{\"approvers\":\"evm_signer_ui\","
-                       "\"custodians\":[\"evm_keystore_ui\",\"wallet_ui\"]}");
-    const QString configured = modules().keystore_module.configure(roles);
-    if (!QJsonDocument::fromJson(configured.toUtf8()).object()
-             .value(QStringLiteral("ok")).toBool()) {
+    QJsonObject roles;
+    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("custodians"),
+                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
+    const QString configured = modules().keystore_module.configure(jsonText(roles));
+    if (!replyOk(configured)) {
         setStatusText(QStringLiteral("keystore_module refused configure"));
         return configured;
     }
@@ -92,13 +114,10 @@ QString WalletUiBackend::createAccount(QString passphrase, QString label)
     QJsonObject params;
     params.insert(QStringLiteral("password"), passphrase);
     params.insert(QStringLiteral("acknowledgeUnrecoverable"), true);
-    const QString r = modules().keystore_module.create_unrelated_account(
-        QString::fromUtf8(QJsonDocument(params).toJson(QJsonDocument::Compact)));
+    const QString r = modules().keystore_module.create_unrelated_account(jsonText(params));
     refreshAccounts();
-    setStatusText(QJsonDocument::fromJson(r.toUtf8()).object()
-                          .value(QStringLiteral("ok")).toBool()
-                      ? QStringLiteral("Account created")
-                      : QStringLiteral("Account creation refused"));
+    setStatusText(replyOk(r) ? QStringLiteral("Account created")
+                             : QStringLiteral("Account creation refused"));
     return r;
 }
 

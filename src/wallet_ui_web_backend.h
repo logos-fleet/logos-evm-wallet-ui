@@ -11,6 +11,13 @@
 
 #include "rep_wallet_ui_source.h"
 
+// Declared, not included: the door itself (logos_web_module_call.h) stays the
+// .cpp's business, and a helper that reports a refusal only needs to name the
+// reply type it is handed.
+namespace logos::web {
+struct ModuleCallResult;
+}
+
 // THE WALLET UI'S `web` VARIANT BACKEND — the same `.rep`, the same QML, a
 // different way of reaching everything behind it (slice 30, criterion 2).
 //
@@ -140,13 +147,17 @@ private:
     // chained shape as ensureChainConfig and for the same reason: the role has to
     // be IN FORCE before the mutation is asked for, and two calls issued in one
     // turn are answered in whatever order the container finishes them. `then`
-    // runs only when the role was taken â a refusal here means the mutation would
-    // be refused too, and saying so once is better than saying it twice.
+    // runs only when the role was taken — a refusal here means the mutation
+    // would be refused too, and saying so once is better than saying it twice.
     void claimCustody(std::function<void()> then);
     // The second link of that chain: the `configure` call itself. Split out so
     // claimCustody reads as the two questions it asks — "who am I here?" and
     // "may I mutate?" — rather than as two nested lambdas.
     void takeCustodianRole(std::function<void()> then);
+    // Announce and show a refused keystore call, in the two places every refusal
+    // here goes, and report whether the caller should stop.
+    bool keystoreRefused(const QString& method, const logos::web::ModuleCallResult& res,
+                         const QJsonObject& reply);
 
     // The two things a configured chain is asked, and the only two continuations
     // ensureChainConfig is ever given.

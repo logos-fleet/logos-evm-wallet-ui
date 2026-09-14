@@ -425,13 +425,8 @@ QString WalletUiWebBackend::createAccount(QString passphrase, QString label)
             QJsonArray{ jsonText(params) },
             [this](const logos::web::ModuleCallResult& res) {
                 const QJsonObject reply = replyOf(res);
-                if (!res.ok || !reply.value(QStringLiteral("ok")).toBool()) {
-                    const QString why = res.ok ? errorOf(reply) : res.error;
-                    announce(QStringLiteral("keystore_module refused "
-                                            "create_unrelated_account: %1").arg(why));
-                    setStatusText(QStringLiteral("keystore_module: %1").arg(why));
+                if (keystoreRefused(QStringLiteral("create_unrelated_account"), res, reply))
                     return;
-                }
                 announce(QStringLiteral("created %1")
                              .arg(reply.value(QStringLiteral("address")).toString()));
                 setStatusText(QStringLiteral("Account created"));
@@ -439,6 +434,22 @@ QString WalletUiWebBackend::createAccount(QString passphrase, QString label)
             });
     });
     return accepted();
+}
+
+bool WalletUiWebBackend::keystoreRefused(const QString& method,
+                                         const logos::web::ModuleCallResult& res,
+                                         const QJsonObject& reply)
+{
+    if (res.ok && reply.value(QStringLiteral("ok")).toBool())
+        return false;
+    // A call that never arrived and one the module turned down are the same
+    // outcome to the caller but not the same reason, so the reason is taken from
+    // whichever it was. The same words then go to the console and to the view's
+    // status line: a device run reads the first and a human reads the second.
+    const QString why = res.ok ? errorOf(reply) : res.error;
+    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    setStatusText(QStringLiteral("keystore_module: %1").arg(why));
+    return true;
 }
 
 void WalletUiWebBackend::claimCustody(std::function<void()> then)
@@ -487,12 +498,8 @@ void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
         kKeystore, QStringLiteral("configure"), QJsonArray{ jsonText(roles) },
         [this, then](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
-            if (!res.ok || !reply.value(QStringLiteral("ok")).toBool()) {
-                const QString why = res.ok ? errorOf(reply) : res.error;
-                announce(QStringLiteral("keystore_module refused configure: %1").arg(why));
-                setStatusText(QStringLiteral("keystore_module: %1").arg(why));
+            if (keystoreRefused(QStringLiteral("configure"), res, reply))
                 return;
-            }
             announce(QStringLiteral("custodians are now %1")
                          .arg(compact(reply.value(QStringLiteral("custodians")).toArray())));
             then();
