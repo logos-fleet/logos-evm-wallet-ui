@@ -25,6 +25,10 @@ const QString kKeystore = QStringLiteral("keystore_module");
 // this image calls it by name — see logos-evm-uniswap-module's flake for the
 // whole of that argument.
 const QString kUniswap = QStringLiteral("uniswap_module");
+// What uniswap puts in a price's `address` field for a chain's NATIVE asset;
+// every other entry carries a real ERC-20 address. Not a display name — the
+// chain list's `nativeSymbol` is that, and is what the item is labelled with.
+const QString kNativeAsset = QStringLiteral("ETH");
 
 // How often the startup wait asks whether the page has a channel yet, and how
 // long it waits before saying it has not. A minute: a cold phone launch mounts
@@ -271,7 +275,7 @@ QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 {
     const QString message =
         QStringLiteral("%1 needs %2, which has no mobile build — the `web` variant "
-                       "does accounts and balances").arg(what, module);
+                       "does accounts, balances and prices").arg(what, module);
     setStatusText(message);
     QJsonObject out;
     out.insert(QStringLiteral("ok"), false);
@@ -749,30 +753,14 @@ void WalletUiWebBackend::fetchPrices(int chainId, const QString& symbol)
                 failure = res.error;
             } else {
                 const QJsonObject reply = replyOf(res);
-                if (!reply.value(QStringLiteral("ok")).toBool()) {
-                    // uniswap's own words, which on a chain it has no deployment
-                    // for are "no uniswap config for chain <id>" — a far more
-                    // useful line than an empty list.
+                // A refusal is carried in uniswap's own words, which on a chain
+                // it has no deployment for are "no uniswap config for chain
+                // <id>" — a far more useful line than an empty list.
+                if (reply.value(QStringLiteral("ok")).toBool())
+                    items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
+                                       chainId, symbol);
+                else
                     failure = errorOf(reply);
-                } else {
-                    for (const QJsonValue& p : reply.value(QStringLiteral("prices")).toArray()) {
-                        const QJsonObject o = p.toObject();
-                        // Only the native asset is asked for today, so only the
-                        // native asset is labelled. A token entry, when
-                        // token_list crosses, carries its own address here.
-                        const QString label =
-                            o.value(QStringLiteral("address")).toString() == QStringLiteral("ETH")
-                                ? (symbol.isEmpty() ? QStringLiteral("ETH") : symbol)
-                                : o.value(QStringLiteral("address")).toString();
-                        QJsonObject item;
-                        item.insert(QStringLiteral("symbol"), label);
-                        item.insert(QStringLiteral("usd"), o.value(QStringLiteral("usd")));
-                        const QJsonValue value = nativeValueUsd(chainId, o);
-                        if (!value.isNull())
-                            item.insert(QStringLiteral("valueUsd"), value);
-                        items.append(item);
-                    }
-                }
             }
 
             QJsonObject entry;
@@ -787,9 +775,33 @@ void WalletUiWebBackend::fetchPrices(int chainId, const QString& symbol)
         });
 }
 
+QJsonArray WalletUiWebBackend::priceItems(const QJsonArray& prices, int chainId,
+                                          const QString& symbol) const
+{
+    QJsonArray items;
+    for (const QJsonValue& p : prices) {
+        const QJsonObject price = p.toObject();
+        const QString address = price.value(QStringLiteral("address")).toString();
+        // Only the native asset is asked for today, so only the native asset is
+        // labelled — with the chain's own symbol where the chain list gave one.
+        // A token entry, when token_list crosses, carries its own address here.
+        const QString label =
+            (address == kNativeAsset && !symbol.isEmpty()) ? symbol : address;
+
+        QJsonObject item;
+        item.insert(QStringLiteral("symbol"), label);
+        item.insert(QStringLiteral("usd"), price.value(QStringLiteral("usd")));
+        const QJsonValue value = nativeValueUsd(chainId, price);
+        if (!value.isNull())
+            item.insert(QStringLiteral("valueUsd"), value);
+        items.append(item);
+    }
+    return items;
+}
+
 QJsonValue WalletUiWebBackend::nativeValueUsd(int chainId, const QJsonObject& price) const
 {
-    if (price.value(QStringLiteral("address")).toString() != QStringLiteral("ETH"))
+    if (price.value(QStringLiteral("address")).toString() != kNativeAsset)
         return {};
     const QJsonValue usd = price.value(QStringLiteral("usd"));
     if (!usd.isDouble())

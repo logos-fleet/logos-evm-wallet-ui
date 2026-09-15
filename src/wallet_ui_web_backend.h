@@ -201,6 +201,13 @@ private:
     // uniswap reporting eth_rpc's own refusal.
     void fetchPrices(int chainId, const QString& symbol);
     void publishMarket();
+    // The `prices` array uniswap answered, in the shape the view's `marketJson`
+    // carries: one item per asset, labelled with the chain's `nativeSymbol`
+    // where the entry is the native asset, and carrying `valueUsd` where a
+    // holding is known. Named rather than written inline in `fetchPrices`'s
+    // reply, where it would be a third level of nesting inside a lambda.
+    QJsonArray priceItems(const QJsonArray& prices, int chainId,
+                          const QString& symbol) const;
     // What the account's holding of this chain's NATIVE asset is worth, from the
     // wei `fetchBalance` last saw and the USD price uniswap just answered. Null
     // — and the view's value column blank — for anything it cannot honestly
