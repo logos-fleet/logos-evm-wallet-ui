@@ -319,9 +319,9 @@ void theCoordinatorsSurfaceStillRefusesByName()
     refusesNaming(backend.sendStatus(QStringLiteral("handle")),
                   QStringLiteral("wallet_backend_module"));
 
-    backend.loadTokens(1);
-    check(backend.statusText().contains(QStringLiteral("token_list_module")),
-          QStringLiteral("the token list refusal does not name its module: %1")
+    backend.refreshHistory(QStringLiteral("0xabc"));
+    check(backend.statusText().contains(QStringLiteral("wallet_backend_module")),
+          QStringLiteral("the history refusal does not name its module: %1")
               .arg(backend.statusText()));
 
     check(fake_door::calls.isEmpty(),
@@ -330,6 +330,183 @@ void theCoordinatorsSurfaceStillRefusesByName()
 
     if (failures == before)
         pass("the coordinator's own surface still refuses by name");
+}
+
+// ── the token list comes out of token_list_module ────────────────────────────
+//
+// #148: this tab answered "Token lists needs token_list_module, which has no
+// mobile build" and made NO CALL, because that module published no
+// `mobile.<target>.bare` and so could not be in a phone's Bundled set. It can
+// now, so the asking is what is checked — and `get_tokens` is deliberately the
+// WHOLE of it: an unconfigured token_list already serves its shipped offline
+// list, so a tab that only reads needs no `configure` and issues no network I/O
+// on a user's first tap.
+void theTokenListComesFromItsOwnModule()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.loadTokens(1);
+    check(!backend.statusText().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("the status line still says token_list has no mobile build: %1")
+              .arg(backend.statusText()));
+
+    const std::optional<fake_door::Call> asked =
+        expectCall(0, QStringLiteral("token_list_module"), QStringLiteral("get_tokens"));
+    if (!asked)
+        return;
+    check(asked->args.size() == 1 && asked->args.at(0).toInt() == 1,
+          QStringLiteral("get_tokens was not asked for the chain the view named: %1")
+              .arg(describe(*asked)));
+    // Nothing else goes out: reading a list is one call, not a configure first.
+    check(fake_door::calls.size() == 1,
+          QStringLiteral("loading a token list made %1 call(s), not 1")
+              .arg(fake_door::calls.size()));
+
+    const QJsonObject row{ { "chainId", 1 },
+                           { "address", "0x1f98…F984" },
+                           { "name", "Uniswap" },
+                           { "symbol", "UNI" },
+                           { "decimals", 18 },
+                           { "source", "embedded" } };
+    fake_door::answerJson(0, QJsonObject{ { "ok", true }, { "tokens", QJsonArray{ row } } });
+
+    // The view reads `tokens` off this PROP, so the module's rows have to reach
+    // it — a reply that was fetched and then dropped is the same blank tab.
+    const QJsonArray published = parse(backend.tokensJson()).value(QStringLiteral("tokens")).toArray();
+    check(published.size() == 1
+              && published.at(0).toObject().value(QStringLiteral("symbol")).toString()
+                  == QStringLiteral("UNI"),
+          QStringLiteral("the module's rows did not reach the view: %1").arg(backend.tokensJson()));
+    check(backend.statusText().contains(QStringLiteral("1")),
+          QStringLiteral("the status line does not say what was loaded: %1")
+              .arg(backend.statusText()));
+
+    if (failures == before)
+        pass("a token list is one get_tokens on token_list_module, and it reaches the view");
+}
+
+// ── a refusal from token_list says what token_list said ──────────────────────
+void aTokenListRefusalIsReportedInItsOwnWords()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.loadTokens(11155111);
+    if (!expectCall(0, QStringLiteral("token_list_module"), QStringLiteral("get_tokens")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", false },
+                                          { "error", "token_list context not ready" } });
+
+    check(backend.statusText().contains(QStringLiteral("token_list context not ready")),
+          QStringLiteral("token_list's own reason did not reach the view: %1")
+              .arg(backend.statusText()));
+    check(!backend.statusText().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("a refused read is reported as a missing build: %1")
+              .arg(backend.statusText()));
+    // An empty list, not the previous chain's rows: a tab that kept showing
+    // chain 1's tokens under a failed chain 11155111 would be wrong silently.
+    check(parse(backend.tokensJson()).value(QStringLiteral("tokens")).toArray().isEmpty(),
+          QStringLiteral("a refused read left rows on the tab: %1").arg(backend.tokensJson()));
+
+    if (failures == before)
+        pass("a refused token list reports token_list's reason and empties the tab");
+}
+
+// ── a custom token is stored by the module that owns the list ────────────────
+void aCustomTokenGoesToTheModuleAndTheListIsReread()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const QString tokenJson = QString::fromUtf8(
+        QJsonDocument(QJsonObject{ { "chainId", 137 },
+                                   { "address", "0xdead" },
+                                   { "name", "Mine" },
+                                   { "symbol", "MINE" },
+                                   { "decimals", 6 } })
+            .toJson(QJsonDocument::Compact));
+    check(backend.addCustomToken(tokenJson),
+          QStringLiteral("addCustomToken refused instead of taking the ask: %1")
+              .arg(backend.statusText()));
+
+    const std::optional<fake_door::Call> added =
+        expectCall(0, QStringLiteral("token_list_module"), QStringLiteral("add_custom_token"));
+    if (!added)
+        return;
+    // ONE params document, exactly as the caller wrote it — the shape
+    // `add_custom_token` deserializes into a Token.
+    const QJsonObject sent =
+        parse(added->args.isEmpty() ? QString() : added->args.at(0).toString());
+    check(sent.value(QStringLiteral("address")).toString() == QStringLiteral("0xdead")
+              && sent.value(QStringLiteral("chainId")).toInt() == 137,
+          QStringLiteral("the token did not reach the module intact: %1").arg(describe(*added)));
+    // A BARE BOOL, which is what `add_custom_token` answers — not the `{ok,…}`
+    // envelope the readers use. The two are different on this wire.
+    fake_door::answerBool(0, true);
+
+    // ...and the tab is re-read FOR THE CHAIN THE TOKEN WAS ADDED ON, so the
+    // row the user just typed is visible without a second tap.
+    const std::optional<fake_door::Call> reread =
+        expectCall(1, QStringLiteral("token_list_module"), QStringLiteral("get_tokens"));
+    if (!reread)
+        return;
+    check(reread->args.size() == 1 && reread->args.at(0).toInt() == 137,
+          QStringLiteral("the re-read was not for the token's chain: %1").arg(describe(*reread)));
+
+    if (failures == before)
+        pass("a custom token is stored by token_list_module and the chain is re-read");
+}
+
+// ── a token the module would not store is not reported as added ──────────────
+//
+// `add_custom_token` answers a BARE BOOL, so "no" carries no reason — and the
+// `.rep` contract already returned true here, meaning only that the ask was
+// taken. If the refusal were dropped the user would be told "Token added" over
+// a list that never gained the row, which is the one outcome worse than an
+// error. Nothing is re-read either: there is nothing new to see.
+void aTokenTheModuleRefusesIsNotReportedAsAdded()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.addCustomToken(QStringLiteral("{\"chainId\":1,\"address\":\"0xdead\"}"));
+    if (!expectCall(0, QStringLiteral("token_list_module"), QStringLiteral("add_custom_token")))
+        return;
+    fake_door::answerBool(0, false);
+
+    check(!backend.statusText().contains(QStringLiteral("Token added")),
+          QStringLiteral("a refused token was reported as added: %1").arg(backend.statusText()));
+    check(fake_door::calls.size() == 1,
+          QStringLiteral("a refused add still re-read the list: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a token token_list would not store is not reported as added");
+}
+
+// ── a token document this image can see is wrong is answered here ────────────
+void aTokenWithNoAddressIsRefusedWithoutAsking()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    check(!backend.addCustomToken(QStringLiteral("{\"chainId\":1,\"symbol\":\"X\"}")),
+          QStringLiteral("a token with no address was accepted"));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("a token with no address still asked the module: %1 calls")
+              .arg(fake_door::calls.size()));
+    check(!backend.statusText().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("a malformed token is reported as a missing build: %1")
+              .arg(backend.statusText()));
+
+    if (failures == before)
+        pass("a token with no address is refused here, without a round trip");
 }
 
 } // namespace
@@ -344,6 +521,11 @@ int main(int argc, char** argv)
     aRefusedLabelDoesNotUnsayTheImport();
     anEmptyPhraseIsRefusedWithoutAsking();
     theCoordinatorsSurfaceStillRefusesByName();
+    theTokenListComesFromItsOwnModule();
+    aTokenListRefusalIsReportedInItsOwnWords();
+    aCustomTokenGoesToTheModuleAndTheListIsReread();
+    aTokenTheModuleRefusesIsNotReportedAsAdded();
+    aTokenWithNoAddressIsRefusedWithoutAsking();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

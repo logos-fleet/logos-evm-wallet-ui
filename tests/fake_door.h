@@ -43,6 +43,14 @@ extern bool admitted;
 // Answer call `i` the way a rust-first module on this wire does: the reply is a
 // JSON TEXT, and the envelope is the module's own `{ok, …}`.
 void answerJson(int i, const QJsonObject& reply);
+// Answer call `i` the way a module whose method returns a BARE BOOL does --
+// `add_custom_token`, `set_chain_config`. Not the same thing as answerJson with
+// `{"ok":true}`: the backend reads `res.value.toBool()`, and a QJsonValue
+// holding a JSON *string* answers false to that whatever the string says. A
+// fixture that could only spell the envelope made a stored token read as a
+// refused one.
+void answerBool(int i, bool value);
+
 // The call never reached the module: the transport's own failure, which is a
 // different outcome from a module that said no.
 void failCall(int i, const QString& error);

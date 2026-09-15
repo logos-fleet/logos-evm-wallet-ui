@@ -22,7 +22,8 @@
     "dependencies": [
       "eth_rpc_module",
       "keystore_module",
-      "uniswap_module"
+      "uniswap_module",
+      "token_list_module"
     ],
     "view_backend": {
       "class": "WalletUiWebBackend",
