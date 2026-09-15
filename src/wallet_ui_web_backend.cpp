@@ -178,15 +178,22 @@ bool callSucceeded(const logos::web::ModuleCallResult& res, const QJsonObject& r
     return res.ok && reply.value(QStringLiteral("ok")).toBool();
 }
 
-// WHY IT DID NOT, ON THE PAGE'S CONSOLE, and the reason handed back for the
-// caller to put on the status line. A call that never arrived and one the module
-// turned down are the same outcome to the caller but not the same reason, so the
-// reason is taken from whichever it was — here, once, because the callers differ
-// only in what they say afterwards.
+// WHY `callSucceeded` SAID NO, in the module's words or the door's. The two are
+// the same outcome to a caller but never the same reason: a call that never
+// arrived carries the transport's error, one the module turned down carries the
+// module's. Read here, once, so no caller has to remember which field to look
+// in — and so every refusal on the status line names the thing that refused.
+QString refusalReason(const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return res.ok ? errorOf(reply) : res.error;
+}
+
+// ...AND THE SAME, ON THE PAGE'S CONSOLE, for the keystore — whose callers
+// differ only in what they say afterwards, so the line itself is written here.
 QString announceKeystoreRefusal(const QString& method, const logos::web::ModuleCallResult& res,
                         const QJsonObject& reply)
 {
-    const QString why = res.ok ? errorOf(reply) : res.error;
+    const QString why = refusalReason(res, reply);
     announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
     return why;
 }
@@ -828,17 +835,13 @@ void WalletUiWebBackend::loadTokens(int chainId)
                          .arg(res.ok ? QStringLiteral("%1 byte(s)").arg(res.value.toString().size())
                                      : res.error));
 
-            QString failure;
+            const QJsonObject reply = replyOf(res);
             QJsonArray tokens;
-            if (!res.ok) {
-                failure = res.error;
-            } else {
-                const QJsonObject reply = replyOf(res);
-                if (reply.value(QStringLiteral("ok")).toBool())
-                    tokens = reply.value(QStringLiteral("tokens")).toArray();
-                else
-                    failure = errorOf(reply);
-            }
+            QString failure;
+            if (callSucceeded(res, reply))
+                tokens = reply.value(QStringLiteral("tokens")).toArray();
+            else
+                failure = refusalReason(res, reply);
 
             // PUBLISHED EITHER WAY, and empty on a failure. The tab shows one
             // chain at a time, so leaving the previous chain's rows up under a
@@ -880,12 +883,16 @@ bool WalletUiWebBackend::addCustomToken(QString tokenJson)
     logos::web::callModuleAsync(
         kTokenList, QStringLiteral("add_custom_token"), QJsonArray{ jsonText(token) },
         [this, chainId](const logos::web::ModuleCallResult& res) {
+            // A BARE BOOL, not the `{ok, …}` envelope the readers above parse:
+            // `add_custom_token` answers the value itself, so `stored` is the
+            // whole of what came back and a door failure is the only other
+            // outcome there is.
             const bool stored = res.ok && res.value.toBool();
-            announce(QStringLiteral("add_custom_token(chain %1) -> %2")
-                         .arg(chainId)
-                         .arg(res.ok ? (stored ? QStringLiteral("stored")
-                                               : QStringLiteral("refused"))
-                                     : res.error));
+            QString outcome = res.error;
+            if (res.ok)
+                outcome = stored ? QStringLiteral("stored") : QStringLiteral("refused");
+            announce(QStringLiteral("add_custom_token(chain %1) -> %2").arg(chainId).arg(outcome));
+
             if (!res.ok) {
                 setStatusText(QStringLiteral("token_list_module never answered: %1").arg(res.error));
                 return;
@@ -976,21 +983,17 @@ void WalletUiWebBackend::fetchPrices(int chainId, const QString& symbol)
                          .arg(res.ok ? "yes" : "no")
                          .arg(res.ok ? res.value.toString() : res.error));
 
+            // A refusal is carried in uniswap's own words, which on a chain it
+            // has no deployment for are "no uniswap config for chain <id>" — a
+            // far more useful line than an empty list.
+            const QJsonObject reply = replyOf(res);
             QJsonArray items;
             QString failure;
-            if (!res.ok) {
-                failure = res.error;
-            } else {
-                const QJsonObject reply = replyOf(res);
-                // A refusal is carried in uniswap's own words, which on a chain
-                // it has no deployment for are "no uniswap config for chain
-                // <id>" — a far more useful line than an empty list.
-                if (reply.value(QStringLiteral("ok")).toBool())
-                    items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
-                                       chainId, symbol);
-                else
-                    failure = errorOf(reply);
-            }
+            if (callSucceeded(res, reply))
+                items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
+                                   chainId, symbol);
+            else
+                failure = refusalReason(res, reply);
 
             QJsonObject entry;
             entry.insert(QStringLiteral("chainId"), chainId);

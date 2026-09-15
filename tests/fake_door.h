@@ -43,7 +43,7 @@ extern bool admitted;
 // Answer call `i` the way a rust-first module on this wire does: the reply is a
 // JSON TEXT, and the envelope is the module's own `{ok, …}`.
 void answerJson(int i, const QJsonObject& reply);
-// Answer call `i` the way a module whose method returns a BARE BOOL does --
+// Answer call `i` the way a module whose method returns a BARE BOOL does —
 // `add_custom_token`, `set_chain_config`. Not the same thing as answerJson with
 // `{"ok":true}`: the backend reads `res.value.toBool()`, and a QJsonValue
 // holding a JSON *string* answers false to that whatever the string says. A

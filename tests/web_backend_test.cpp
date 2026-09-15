@@ -379,7 +379,9 @@ void theTokenListComesFromItsOwnModule()
               && published.at(0).toObject().value(QStringLiteral("symbol")).toString()
                   == QStringLiteral("UNI"),
           QStringLiteral("the module's rows did not reach the view: %1").arg(backend.tokensJson()));
-    check(backend.statusText().contains(QStringLiteral("1")),
+    // The COUNT, not a bare "1" — which "chain 1" would satisfy on its own and
+    // so would a status line that never learned how many rows arrived.
+    check(backend.statusText().contains(QStringLiteral("1 token(s)")),
           QStringLiteral("the status line does not say what was loaded: %1")
               .arg(backend.statusText()));
 
@@ -437,8 +439,9 @@ void aCustomTokenGoesToTheModuleAndTheListIsReread()
         expectCall(0, QStringLiteral("token_list_module"), QStringLiteral("add_custom_token"));
     if (!added)
         return;
-    // ONE params document, exactly as the caller wrote it — the shape
-    // `add_custom_token` deserializes into a Token.
+    // ONE params document, carrying what the caller wrote — the shape
+    // `add_custom_token` deserializes into a Token. Re-rendered on the way out
+    // rather than forwarded verbatim, so what is asserted is the FIELDS.
     const QJsonObject sent =
         parse(added->args.isEmpty() ? QString() : added->args.at(0).toString());
     check(sent.value(QStringLiteral("address")).toString() == QStringLiteral("0xdead")
