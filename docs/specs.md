@@ -345,6 +345,23 @@ Imports an account from a BIP-39 mnemonic.
 - **`label`** — label for the imported account.
 - **Backend call:** `import_mnemonic(phraseJson, label) -> String`; then `refreshAccounts()`.
 - **Returns:** backend JSON for the imported account. `statusText` = `"Account imported"`.
+- **`web` variant (#147):** no coordinator, so the phrase document goes straight to
+  `keystore_module.import_mnemonic(phraseJson)` — preceded by the same
+  `caller_identity` + `configure` pair `createAccount` runs, because importing a key is
+  **Tier D** and the role has to be in force before the mutation is asked for. The
+  document is forwarded **whole**, so every optional field the keystore understands
+  (`passphrase`, `storage`, `bip44Account`, `groupLabel`, …) reaches it. The **label**
+  then goes to `keystore_module.set_label(address, label, password)` — there is no
+  coordinator here to keep a `labels.json` of its own — and a refused label is reported
+  beside `"Account imported"` (`"Account imported — label not set: …"`) rather than in
+  place of it: the key is in the keystore either way. An empty phrase is refused here,
+  without a round trip (`"Import needs a seed phrase"`).
+
+  Until #147 this method answered *"Mnemonic import needs keystore_module, which has no
+  mobile build"* and made no call at all, while the keystore — itself a `web` variant on
+  a phone — was loaded and answering `list_accounts` in the same run. That wording is for
+  a module that really is absent (`wallet_backend_module`, `token_list_module`); a method
+  this variant has not implemented says so in its own words.
 
 ##### `void refreshAccounts()`
 
@@ -711,6 +728,31 @@ scroll) and `--user-dir <dir>` to isolate a run's module state. Headless operati
 A rendered, interactive UI is itself proof that the entire dependency tree
 (`wallet_backend_module` + `eth_rpc_module` + `keystore_module` + `token_list_module` +
 `uniswap_module`) loaded — the UI's calls only return because the backend is live.
+
+### `checks.<system>.web-backend` — what the `web` variant asks for
+
+The `web` variant has no coordinator: its whole contract is a sequence of calls to modules
+it names, and a defect in that sequence is invisible to a build. #147 was exactly that —
+`importMnemonic` answered "needs keystore_module, which has no mobile build" and **made no
+call at all**, while the keystore was loaded and answering in the same run.
+
+So `src/wallet_ui_web_backend.cpp` — the shipped translation unit, the one the Qt-wasm image
+compiles — is built **natively** with its single door out
+(`logos::web::callModuleAsync`) replaced by a recorder, and driven from
+`tests/web_backend_test.cpp`: which module, which method, with what arguments, in what
+order, and that the methods this variant really cannot serve still refuse **by name**.
+
+```bash
+nix build .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).web-backend
+ws test logos-evm-wallet-ui --local logos-module-builder   # within the workspace
+```
+
+It is not emscripten and not a container, so it says nothing about wasm-specific behaviour
+or about whether the modules it names answer — `keystore_module`'s own `web-variant` check
+drives a real image for that. **It needs the door's header**
+(`logos-module-builder`'s `wasm/logos_web_module_call.h`): a builder pin from before the
+Wasm host existed makes the check a skip stub that says so, which is why the workspace
+invocation above passes `--local logos-module-builder`.
 
 ### Doc-tests (`doctests/*.test.yaml`)
 
