@@ -400,6 +400,15 @@ Kicks off the per-chain price fan-out for the account's held tokens.
   and surfaced via the `market_updated` event, which the UI handles by calling
   `get_market(address)` → `marketJson`.
 - **Returns:** nothing. `statusText` transitions `"Loading market…"` → `"Market updated"`.
+- **`web` variant (#148):** no coordinator, so it asks `uniswap_module` itself — one
+  `get_prices(chainId, {"tokens":[]})` per configured chain, each preceded by the same
+  `eth_rpc_module.set_chain_config` step a balance takes (uniswap's price *is* a Multicall3
+  `eth_call` issued back through eth_rpc). The token list is empty because
+  `token_list_module` has no mobile build; `get_prices` still reports the chain's **native**
+  asset, anchored in USD through the chain's stablecoins, and the item carries `valueUsd`
+  when a balance for that chain has already been seen. A chain uniswap has no deployment
+  for (Sepolia) contributes its own refusal to `statusText` rather than a silent blank:
+  `"Market updated — chain 11155111: no uniswap config for chain 11155111"`.
 
 ---
 

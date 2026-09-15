@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QJsonArray>
+#include <QJsonValue>
+#include <QHash>
 #include <QJsonObject>
 #include <QSet>
 #include <QString>
@@ -34,14 +36,22 @@ struct ModuleCallResult;
 // and nothing else, which is the honest amount.
 //
 // WHAT IT TALKS TO, and why it is not `wallet_backend_module`. The coordinator
-// is a `core` module with five dependencies of its own, none of which has a
-// mobile Bare build; `eth_rpc_module` does, and a balance is one call to it.
-// So the `web` variant is the wallet's thin half: accounts out of
-// `keystore_module` (itself a `web` variant on a phone) and balances straight
-// out of the Bundled `eth_rpc_module`. Everything the coordinator owns —
-// sends, the market, history — REFUSES BY NAME rather than returning
-// a plausible empty value, so a user is told the variant cannot do it and a
+// is a `core` module with five dependencies of its own and no mobile Bare build;
+// `eth_rpc_module` and `uniswap_module` do have one, and a balance or a price is
+// one call to the module that owns it. So the `web` variant is the wallet's thin
+// half, and it asks each module directly rather than through the coordinator:
+// accounts out of `keystore_module` (itself a `web` variant on a phone),
+// balances out of the Bundled `eth_rpc_module`, prices out of the Bundled
+// `uniswap_module` (#148). What the coordinator STILL owns alone — sends, fee
+// estimation, history, token lists — REFUSES BY NAME rather than returning a
+// plausible empty value, so a user is told the variant cannot do it and a
 // developer is told which module is missing.
+//
+// GOING THROUGH THE COORDINATOR WOULD NOT BE CHEAPER. `wallet_backend_module`'s
+// closure names all five of the wallet's modules, so a Bundled set that carried
+// it and not them could not satisfy it — which is why each module the phone has
+// is reached by name, and why this file grows one section per module ported
+// rather than shrinking to one call.
 //
 // ONE DOOR OUT: logos::web::callModuleAsync (logos_web_module_call.h), which
 // only exists inside the Wasm host. This header is therefore only ever
@@ -74,7 +84,7 @@ public slots:
     void loadTokens(int chainId) override;
     bool addCustomToken(QString tokenJson) override;
 
-    // Market
+    // Market — uniswap_module
     void refreshMarket(QString address) override;
 
     // Send
@@ -113,6 +123,24 @@ private:
     quint64 m_balanceEpoch = 0;
     int m_balancePending = 0;
     QJsonObject m_balances;
+
+    // The market fan-out, the same single-slot-plus-epoch shape as the balance
+    // one above and for the same reasons — one account at a time, a second ask
+    // supersedes the first, and a reply from a superseded fan-out is dropped
+    // rather than merged into the one that replaced it.
+    quint64 m_marketEpoch = 0;
+    int m_marketPending = 0;
+    QJsonObject m_market;
+
+    // The last native balance seen per chain, in WEI, as `fetchBalance` read it
+    // off eth_rpc — kept so the Market tab can show a value and not only a
+    // price. A CACHE OF AN OBSERVATION, never a source of truth: a chain that
+    // has not answered a balance yet is simply absent, and the market item for
+    // it then carries no `valueUsd`, which is exactly what the view renders as
+    // blank. (Refreshing the market does not fetch balances: the two tabs are
+    // separate asks, and a market refresh that silently re-read every balance
+    // would spend a chain's RPC budget twice for one number.)
+    QHash<int, QString> m_nativeWei;
 
     // The chains `eth_rpc_module` has been told about in this page's lifetime.
     // A `web` variant's page dies with the app, and eth_rpc's config is the
@@ -164,6 +192,29 @@ private:
     void fetchBalance(const QString& address, int chainId, const QString& symbol);
     void publishBalances();
     void publishChains();
+
+    // The market's counterpart of the pair above: the continuation
+    // ensureChainConfig is given by refreshMarket, and the publish its replies
+    // count down to. `fetchPrices` needs eth_rpc configured for the chain even
+    // though it asks UNISWAP — uniswap's every price is one Multicall3
+    // `eth_call` issued through eth_rpc, so an unconfigured chain comes back as
+    // uniswap reporting eth_rpc's own refusal.
+    void fetchPrices(int chainId, const QString& symbol);
+    void publishMarket();
+    // The `prices` array uniswap answered, in the shape the view's `marketJson`
+    // carries: one item per asset, labelled with the chain's `nativeSymbol`
+    // where the entry is the native asset, and carrying `valueUsd` where a
+    // holding is known. Named rather than written inline in `fetchPrices`'s
+    // reply, where it would be a third level of nesting inside a lambda.
+    QJsonArray priceItems(const QJsonArray& prices, int chainId,
+                          const QString& symbol) const;
+    // What the account's holding of this chain's NATIVE asset is worth, from the
+    // wei `fetchBalance` last saw and the USD price uniswap just answered. Null
+    // — and the view's value column blank — for anything it cannot honestly
+    // multiply: a price entry that is not the native asset (no balance is known
+    // for a token here), a chain that has answered no balance yet, or a price
+    // uniswap could not anchor in USD.
+    QJsonValue nativeValueUsd(int chainId, const QJsonObject& price) const;
 
     // What every method this variant does not implement answers with. Names the
     // module that would have served it, so the refusal is diagnosable.

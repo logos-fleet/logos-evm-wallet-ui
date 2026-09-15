@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QStringList>
 
 // The only way out of a wasm image. See wallet_ui_web_backend.h for why this
 // backend exists at all, and logos_web_module_call.h for what the door is.
@@ -16,6 +17,18 @@ const QString kEthRpc = QStringLiteral("eth_rpc_module");
 // The module an account comes from: itself a `web` variant on a Store shell,
 // which the container publishes by name exactly as it does a native one.
 const QString kKeystore = QStringLiteral("keystore_module");
+// The module a PRICE comes from, and a Bundled Bare module like eth_rpc rather
+// than a `web` variant like the keystore: uniswap's every method is one
+// Multicall3 `eth_call` issued synchronously through eth_rpc, and a wasm image
+// has no outbound door to issue it from (logos-protocol's wasm subset links no
+// lp_client_create). So uniswap crosses to a phone as native machine code and
+// this image calls it by name — see logos-evm-uniswap-module's flake for the
+// whole of that argument.
+const QString kUniswap = QStringLiteral("uniswap_module");
+// What uniswap puts in a price's `address` field for a chain's NATIVE asset;
+// every other entry carries a real ERC-20 address. Not a display name — the
+// chain list's `nativeSymbol` is that, and is what the item is labelled with.
+const QString kNativeAsset = QStringLiteral("ETH");
 
 // How often the startup wait asks whether the page has a channel yet, and how
 // long it waits before saying it has not. A minute: a cold phone launch mounts
@@ -262,7 +275,7 @@ QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 {
     const QString message =
         QStringLiteral("%1 needs %2, which has no mobile build — the `web` variant "
-                       "does accounts and balances").arg(what, module);
+                       "does accounts, balances and prices").arg(what, module);
     setStatusText(message);
     QJsonObject out;
     out.insert(QStringLiteral("ok"), false);
@@ -613,6 +626,13 @@ void WalletUiWebBackend::fetchBalance(const QString& address, int chainId,
                              wei.isString()
                                  ? QStringLiteral("%1 %2").arg(wei.toString(), symbol)
                                  : QStringLiteral("unavailable (%1)").arg(errorOf(reply)));
+                // KEPT AS THE NUMBER, not re-parsed out of the line above: the
+                // Market tab multiplies it by a price, and "<wei> ETH" is a
+                // string built for a human. A chain that did not answer leaves
+                // the last known value alone rather than storing a zero, which
+                // would read as "you hold nothing" instead of "we do not know".
+                if (wei.isString())
+                    m_nativeWei.insert(chainId, wei.toString());
             }
             entry.insert(QStringLiteral("tokens"), QJsonArray{});
             m_balances.insert(QString::number(chainId), entry);
@@ -659,11 +679,176 @@ bool WalletUiWebBackend::addCustomToken(QString tokenJson)
     return false;
 }
 
+// ── market: the Bundled uniswap_module (#148) ───────────────────────────────
+//
+// THE SECOND MODULE THIS VARIANT REACHES BY NAME, and the same two-step shape as
+// a balance: configure the chain on eth_rpc, then ask. The ask goes to UNISWAP,
+// which issues its own Multicall3 `eth_call` back through eth_rpc — so the
+// endpoint has to be in eth_rpc before the price is asked for, exactly as it
+// does before a balance, and for the reason ensureChainConfig's note gives.
+//
+// WHAT IT PRICES, and why the token list is empty. `token_list_module` has no
+// mobile build, so this image holds no list of a user's ERC-20s and passes
+// `{"tokens":[]}` — which is not an empty question: `get_prices` always reports
+// the chain's native asset, anchored on the chain's stablecoins through the
+// pools it derives offline. So the Market tab shows a real ETH price on every
+// chain uniswap has a deployment for, and gains the user's tokens for free the
+// day token_list crosses (this call then takes the list it publishes).
+//
+// `address` IS UNUSED, and that is not an oversight. A price is a property of a
+// chain, not of an account; the account only enters when a price is multiplied
+// by a holding, which is `m_nativeWei` below. The parameter stays because the
+// `.rep` contract and the desktop backend — where the coordinator prices the
+// account's WATCHED tokens — both have it.
 void WalletUiWebBackend::refreshMarket(QString address)
 {
-    Q_UNUSED(address)
-    refuse(QStringLiteral("Market prices"), QStringLiteral("uniswap_module"));
-    setMarketJson(QStringLiteral("{\"chains\":[]}"));
+    const quint64 epoch = ++m_marketEpoch;
+    m_market = QJsonObject();
+    // COUNTED IN FULL BEFORE ANY CALL GOES OUT, for the reason refreshBalances
+    // states: a chain already configured asks from inside this loop and one not
+    // yet configured asks from a later turn, so counting as each ask is issued
+    // would let the first reply find a counter of 1 and publish an aggregate
+    // still missing every other chain.
+    m_marketPending = m_chains.size();
+    setStatusText(QStringLiteral("Loading market…"));
+    announce(QStringLiteral("refreshMarket(%1): %2 chain(s), %3")
+                 .arg(address)
+                 .arg(m_chains.size())
+                 .arg(doorState()));
+
+    for (const QJsonValue& c : m_chains) {
+        const QJsonObject o = c.toObject();
+        const int chainId = o.value(QStringLiteral("chainId")).toInt();
+        const QString symbol = o.value(QStringLiteral("nativeSymbol")).toString();
+        ensureChainConfig(
+            chainId, o.value(QStringLiteral("rpcUrl")).toString(),
+            [this, epoch, chainId, symbol]() {
+                if (epoch != m_marketEpoch)
+                    return;
+                fetchPrices(chainId, symbol);
+            });
+    }
+    if (m_marketPending == 0)
+        publishMarket();
+}
+
+void WalletUiWebBackend::fetchPrices(int chainId, const QString& symbol)
+{
+    const quint64 epoch = m_marketEpoch;
+    logos::web::callModuleAsync(
+        kUniswap, QStringLiteral("get_prices"),
+        QJsonArray{ chainId, QStringLiteral("{\"tokens\":[]}") },
+        [this, epoch, chainId, symbol](const logos::web::ModuleCallResult& res) {
+            if (epoch != m_marketEpoch)
+                return;
+
+            announce(QStringLiteral("get_prices(%1) -> ok=%2 %3")
+                         .arg(chainId)
+                         .arg(res.ok ? "yes" : "no")
+                         .arg(res.ok ? res.value.toString() : res.error));
+
+            QJsonArray items;
+            QString failure;
+            if (!res.ok) {
+                failure = res.error;
+            } else {
+                const QJsonObject reply = replyOf(res);
+                // A refusal is carried in uniswap's own words, which on a chain
+                // it has no deployment for are "no uniswap config for chain
+                // <id>" — a far more useful line than an empty list.
+                if (reply.value(QStringLiteral("ok")).toBool())
+                    items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
+                                       chainId, symbol);
+                else
+                    failure = errorOf(reply);
+            }
+
+            QJsonObject entry;
+            entry.insert(QStringLiteral("chainId"), chainId);
+            entry.insert(QStringLiteral("items"), items);
+            if (!failure.isEmpty())
+                entry.insert(QStringLiteral("error"), failure);
+            m_market.insert(QString::number(chainId), entry);
+
+            if (--m_marketPending <= 0)
+                publishMarket();
+        });
+}
+
+QJsonArray WalletUiWebBackend::priceItems(const QJsonArray& prices, int chainId,
+                                          const QString& symbol) const
+{
+    QJsonArray items;
+    for (const QJsonValue& p : prices) {
+        const QJsonObject price = p.toObject();
+        const QString address = price.value(QStringLiteral("address")).toString();
+        // Only the native asset is asked for today, so only the native asset is
+        // labelled — with the chain's own symbol where the chain list gave one.
+        // A token entry, when token_list crosses, carries its own address here.
+        const QString label =
+            (address == kNativeAsset && !symbol.isEmpty()) ? symbol : address;
+
+        QJsonObject item;
+        item.insert(QStringLiteral("symbol"), label);
+        item.insert(QStringLiteral("usd"), price.value(QStringLiteral("usd")));
+        const QJsonValue value = nativeValueUsd(chainId, price);
+        if (!value.isNull())
+            item.insert(QStringLiteral("valueUsd"), value);
+        items.append(item);
+    }
+    return items;
+}
+
+QJsonValue WalletUiWebBackend::nativeValueUsd(int chainId, const QJsonObject& price) const
+{
+    if (price.value(QStringLiteral("address")).toString() != kNativeAsset)
+        return {};
+    const QJsonValue usd = price.value(QStringLiteral("usd"));
+    if (!usd.isDouble())
+        return {};
+    const auto it = m_nativeWei.constFind(chainId);
+    if (it == m_nativeWei.constEnd())
+        return {};
+
+    // WEI IS 256-BIT AND A DOUBLE IS NOT, so the scale comes off before the
+    // conversion: `toDouble` on the decimal string is exact to ~15 digits, which
+    // for a dollar figure shown to two decimal places is more precision than the
+    // price it is multiplied by has. A value that does not parse (eth_rpc
+    // answering something unexpected) is no value rather than zero.
+    bool ok = false;
+    const double wei = it.value().toDouble(&ok);
+    if (!ok)
+        return {};
+    return wei / 1e18 * usd.toDouble();
+}
+
+void WalletUiWebBackend::publishMarket()
+{
+    // Chain order, not reply order — the same rule publishBalances states.
+    QJsonArray chains;
+    QStringList refusals;
+    for (const QJsonValue& c : m_chains) {
+        const int chainId = c.toObject().value(QStringLiteral("chainId")).toInt();
+        const QString key = QString::number(chainId);
+        if (!m_market.contains(key))
+            continue;
+        const QJsonObject entry = m_market.value(key).toObject();
+        chains.append(entry);
+        const QString why = entry.value(QStringLiteral("error")).toString();
+        if (!why.isEmpty())
+            refusals.append(QStringLiteral("chain %1: %2").arg(chainId).arg(why));
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("chains"), chains);
+    setMarketJson(jsonText(root));
+    // A PARTIAL ANSWER SAYS SO. Sepolia has no Uniswap deployment in the
+    // module's defaults, so a two-chain wallet legitimately prices one chain and
+    // not the other; reporting "Market updated" for that would hide the only
+    // line that explains the blank half.
+    setStatusText(refusals.isEmpty()
+                      ? QStringLiteral("Market updated")
+                      : QStringLiteral("Market updated — %1").arg(refusals.join(QStringLiteral("; "))));
+    announce(QStringLiteral("published market: %1").arg(jsonText(chains)));
 }
 
 QString WalletUiWebBackend::estimateFee(QString sendJson)
