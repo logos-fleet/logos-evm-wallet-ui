@@ -30,7 +30,10 @@
     module // {
       # ADDED TO the builder's checks, never in place of them: mkLogosQmlModule
       # publishes this module's integration test under the same attribute, and
-      # replacing the set would drop it silently.
+      # replacing the set would drop it silently. Merged at BOTH levels for that
+      # reason — the builder keys its checks over its own systems list, which
+      # carries the x86_64-windows pseudo-system this check has no native
+      # nixpkgs for, so those keys pass through untouched.
       #
       # `web-backend` drives the `web` variant's backend natively against a
       # recorded door — see nix/web-backend-test.nix for what that can and
@@ -42,7 +45,7 @@
       # the same pin that publishes no `web` variant for this module at all. A
       # check that failed there would be reporting a pin rollout as a defect;
       # one that was simply absent would be a green run with a missing test.
-      checks = nixpkgs.lib.genAttrs systems (system:
+      checks = (module.checks or { }) // nixpkgs.lib.genAttrs systems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           door = "${logos-module-builder}/wasm";

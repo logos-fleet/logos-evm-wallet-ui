@@ -162,6 +162,28 @@ QString failed(const QString& why)
     return jsonText(out);
 }
 
+// THE TWO THINGS THAT HAVE TO BE TRUE for a call to have worked: the door
+// delivered it, and the module said yes. Read together because either one alone
+// is a refusal, and a reply read as a value when `ok` was false is the mistake
+// this exists to stop.
+bool callSucceeded(const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return res.ok && reply.value(QStringLiteral("ok")).toBool();
+}
+
+// WHY IT DID NOT, ON THE PAGE'S CONSOLE, and the reason handed back for the
+// caller to put on the status line. A call that never arrived and one the module
+// turned down are the same outcome to the caller but not the same reason, so the
+// reason is taken from whichever it was — here, once, because the callers differ
+// only in what they say afterwards.
+QString announceKeystoreRefusal(const QString& method, const logos::web::ModuleCallResult& res,
+                        const QJsonObject& reply)
+{
+    const QString why = res.ok ? errorOf(reply) : res.error;
+    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    return why;
+}
+
 } // namespace
 
 WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
@@ -499,14 +521,11 @@ bool WalletUiWebBackend::keystoreRefused(const QString& method,
                                          const logos::web::ModuleCallResult& res,
                                          const QJsonObject& reply)
 {
-    if (res.ok && reply.value(QStringLiteral("ok")).toBool())
+    if (callSucceeded(res, reply))
         return false;
-    // A call that never arrived and one the module turned down are the same
-    // outcome to the caller but not the same reason, so the reason is taken from
-    // whichever it was. The same words then go to the console and to the view's
-    // status line: a device run reads the first and a human reads the second.
-    const QString why = res.ok ? errorOf(reply) : res.error;
-    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    // The same words go to the console and to the view's status line: a device
+    // run reads the first and a human reads the second.
+    const QString why = announceKeystoreRefusal(method, res, reply);
     setStatusText(QStringLiteral("keystore_module: %1").arg(why));
     return true;
 }
@@ -625,11 +644,14 @@ void WalletUiWebBackend::labelAccount(const QString& address, const QString& lab
         kKeystore, QStringLiteral("set_label"), QJsonArray{ address, label, password },
         [this, address, label](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
-            if (res.ok && reply.value(QStringLiteral("ok")).toBool()) {
+            if (callSucceeded(res, reply)) {
                 announce(QStringLiteral("labelled %1 \"%2\"").arg(address, label));
             } else {
-                const QString why = res.ok ? errorOf(reply) : res.error;
-                announce(QStringLiteral("keystore_module refused set_label: %1").arg(why));
+                // NOT `keystoreRefused`: that one replaces the status line with
+                // the keystore's reason, which here would unsay "Account
+                // imported" for a key that is in the keystore all the same.
+                const QString why =
+                    announceKeystoreRefusal(QStringLiteral("set_label"), res, reply);
                 setStatusText(QStringLiteral("Account imported — label not set: %1").arg(why));
             }
             refreshAccounts();

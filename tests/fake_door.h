@@ -17,7 +17,6 @@
 // set.
 #include <QJsonArray>
 #include <QJsonObject>
-#include <QJsonValue>
 #include <QString>
 #include <QVector>
 
@@ -44,8 +43,6 @@ extern bool admitted;
 // Answer call `i` the way a rust-first module on this wire does: the reply is a
 // JSON TEXT, and the envelope is the module's own `{ok, …}`.
 void answerJson(int i, const QJsonObject& reply);
-// Answer with a bare value — eth_rpc's `set_chain_config` shape.
-void answerValue(int i, const QJsonValue& value);
 // The call never reached the module: the transport's own failure, which is a
 // different outcome from a module that said no.
 void failCall(int i, const QString& error);

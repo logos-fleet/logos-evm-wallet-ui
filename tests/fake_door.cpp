@@ -2,6 +2,7 @@
 
 #include <QDebug>
 #include <QJsonDocument>
+#include <QJsonValue>
 
 namespace fake_door {
 
@@ -44,14 +45,6 @@ void answerJson(int i, const QJsonObject& reply)
     logos::web::ModuleCallResult res;
     res.ok = true;
     res.value = QJsonValue(jsonText(reply));
-    deliver(i, res);
-}
-
-void answerValue(int i, const QJsonValue& value)
-{
-    logos::web::ModuleCallResult res;
-    res.ok = true;
-    res.value = value;
     deliver(i, res);
 }
 

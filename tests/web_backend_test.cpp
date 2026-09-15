@@ -26,6 +26,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 
 #include "fake_door.h"
 #include "wallet_ui_web_backend.h"
@@ -63,11 +64,16 @@ QString describe(const fake_door::Call& c)
              QString::fromUtf8(QJsonDocument(c.args).toJson(QJsonDocument::Compact)));
 }
 
-// Call `i` was made, and it was this one. Answers a pointer so a case can STOP
+// Call `i` was made, and it was this one. Answers an optional so a case can STOP
 // at the first call that is missing or wrong: every later assertion in a drive
 // that chains replies would otherwise fail for the same one reason, and the
 // line that matters would be the first of a dozen.
-const fake_door::Call* expectCall(int i, const QString& module, const QString& method)
+//
+// A COPY, NOT A REFERENCE INTO `fake_door::calls`: answering a call commonly
+// makes the next one, which appends to that vector and may move its storage —
+// the same hazard fake_door.cpp's `deliver` takes the callback out of the record
+// for.
+std::optional<fake_door::Call> expectCall(int i, const QString& module, const QString& method)
 {
     if (i >= fake_door::calls.size()) {
         fail(QStringLiteral("no call #%1 was made; expected %2.%3, and the backend made "
@@ -75,16 +81,16 @@ const fake_door::Call* expectCall(int i, const QString& module, const QString& m
                  .arg(i)
                  .arg(module, method)
                  .arg(fake_door::calls.size()));
-        return nullptr;
+        return std::nullopt;
     }
-    const fake_door::Call& c = fake_door::calls.at(i);
+    const fake_door::Call c = fake_door::calls.at(i);
     if (c.module != module || c.method != method) {
         fail(QStringLiteral("call #%1 was %2; expected %3.%4")
                  .arg(i)
                  .arg(describe(c), module, method));
-        return nullptr;
+        return std::nullopt;
     }
-    return &c;
+    return c;
 }
 
 // The two calls every Tier D mutation on the keystore is preceded by: "who am I
@@ -137,7 +143,7 @@ void importGoesToTheKeystore()
     if (!admitTheCustodian(0))
         return;
 
-    const fake_door::Call* imported =
+    const std::optional<fake_door::Call> imported =
         expectCall(2, QStringLiteral("keystore_module"), QStringLiteral("import_mnemonic"));
     if (!imported)
         return;
@@ -161,7 +167,7 @@ void importGoesToTheKeystore()
     // The LABEL is the user's other field on that form, and the keystore is the
     // only place this variant can put it — there is no coordinator here to keep
     // a labels.json of its own.
-    const fake_door::Call* labelled =
+    const std::optional<fake_door::Call> labelled =
         expectCall(3, QStringLiteral("keystore_module"), QStringLiteral("set_label"));
     if (!labelled)
         return;
@@ -227,6 +233,42 @@ void withoutALabelNothingIsLabelled()
 
     if (failures == before)
         pass("an import with no label goes straight to the account list");
+}
+
+// ── a label that will not stick is not a failed import ───────────────────────
+//
+// The other half of `labelAccount`, and the DOOR's own failure rather than a
+// refusal from the keystore: the two are different reasons for the same outcome
+// and the backend reads them out of different fields. Either way the key is in
+// the keystore, so the import stays reported as done and the list is still
+// re-read — a wallet that hid a new account because its name did not take would
+// be the worse of the two wrongs.
+void aRefusedLabelDoesNotUnsayTheImport()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.importMnemonic(phraseJson(), QStringLiteral("main"));
+    if (!admitTheCustodian(0)
+        || !expectCall(2, QStringLiteral("keystore_module"), QStringLiteral("import_mnemonic")))
+        return;
+    fake_door::answerJson(2, QJsonObject{ { "ok", true }, { "address", "0xabc" } });
+
+    if (!expectCall(3, QStringLiteral("keystore_module"), QStringLiteral("set_label")))
+        return;
+    fake_door::failCall(3, QStringLiteral("the door never delivered it"));
+
+    check(backend.statusText().contains(QStringLiteral("Account imported")),
+          QStringLiteral("a label that did not stick unsaid the import: %1")
+              .arg(backend.statusText()));
+    check(backend.statusText().contains(QStringLiteral("the door never delivered it")),
+          QStringLiteral("the reason the label did not stick never reached the view: %1")
+              .arg(backend.statusText()));
+    expectCall(4, QStringLiteral("keystore_module"), QStringLiteral("list_accounts"));
+
+    if (failures == before)
+        pass("a label that will not stick leaves the import reported as done");
 }
 
 // ── a missing phrase is answered here ────────────────────────────────────────
@@ -299,6 +341,7 @@ int main(int argc, char** argv)
     importGoesToTheKeystore();
     aKeystoreRefusalIsReportedInItsOwnWords();
     withoutALabelNothingIsLabelled();
+    aRefusedLabelDoesNotUnsayTheImport();
     anEmptyPhraseIsRefusedWithoutAsking();
     theCoordinatorsSurfaceStillRefusesByName();
 
