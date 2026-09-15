@@ -25,6 +25,13 @@ const QString kKeystore = QStringLiteral("keystore_module");
 // this image calls it by name — see logos-evm-uniswap-module's flake for the
 // whole of that argument.
 const QString kUniswap = QStringLiteral("uniswap_module");
+// The module a TOKEN LIST comes from, and a Bundled Bare module for the same
+// kind of reason uniswap is — but a blunter one. token_list_module declares
+// `platform: true` (ADR 0009): it builds its own HTTP client with `socks` and a
+// `proxyRequired` that fails CLOSED, which is access a webview cannot give a
+// page and cannot be ported to `fetch` without silently voiding that guarantee.
+// So it crosses as native machine code and this image calls it by name.
+const QString kTokenList = QStringLiteral("token_list_module");
 // What uniswap puts in a price's `address` field for a chain's NATIVE asset;
 // every other entry carries a real ERC-20 address. Not a display name — the
 // chain list's `nativeSymbol` is that, and is what the item is labelled with.
@@ -171,15 +178,22 @@ bool callSucceeded(const logos::web::ModuleCallResult& res, const QJsonObject& r
     return res.ok && reply.value(QStringLiteral("ok")).toBool();
 }
 
-// WHY IT DID NOT, ON THE PAGE'S CONSOLE, and the reason handed back for the
-// caller to put on the status line. A call that never arrived and one the module
-// turned down are the same outcome to the caller but not the same reason, so the
-// reason is taken from whichever it was — here, once, because the callers differ
-// only in what they say afterwards.
+// WHY `callSucceeded` SAID NO, in the module's words or the door's. The two are
+// the same outcome to a caller but never the same reason: a call that never
+// arrived carries the transport's error, one the module turned down carries the
+// module's. Read here, once, so no caller has to remember which field to look
+// in — and so every refusal on the status line names the thing that refused.
+QString refusalReason(const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return res.ok ? errorOf(reply) : res.error;
+}
+
+// ...AND THE SAME, ON THE PAGE'S CONSOLE, for the keystore — whose callers
+// differ only in what they say afterwards, so the line itself is written here.
 QString announceKeystoreRefusal(const QString& method, const logos::web::ModuleCallResult& res,
                         const QJsonObject& reply)
 {
-    const QString why = res.ok ? errorOf(reply) : res.error;
+    const QString why = refusalReason(res, reply);
     announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
     return why;
 }
@@ -304,10 +318,10 @@ void WalletUiWebBackend::publishChains()
     setChainsJson(jsonText(root));
 }
 
-// ONLY FOR A MODULE THAT REALLY IS NOT HERE. `wallet_backend_module` and
-// `token_list_module` have no mobile Bare build, which is why this variant talks
-// to `eth_rpc_module` and `uniswap_module` directly and cannot serve sends, fee
-// estimation, history or token lists at all.
+// ONLY FOR A MODULE THAT REALLY IS NOT HERE. `wallet_backend_module` is the
+// last one, which is why this variant talks to `eth_rpc_module`,
+// `uniswap_module` and `token_list_module` directly and still cannot serve
+// sends, fee estimation or history at all.
 //
 // IT IS NOT THE ANSWER TO "THIS METHOD IS NOT IMPLEMENTED YET", and #147 is what
 // that mistake costs: `importMnemonic` refused with these words while
@@ -319,7 +333,8 @@ QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 {
     const QString message =
         QStringLiteral("%1 needs %2, which has no mobile build — the `web` variant "
-                       "does accounts, balances and prices").arg(what, module);
+                       "does accounts, balances, prices and token lists")
+            .arg(what, module);
     setStatusText(message);
     return failed(message);
 }
@@ -785,20 +800,115 @@ void WalletUiWebBackend::publishBalances()
     announce(QStringLiteral("published balances: %1").arg(jsonText(inner)));
 }
 
-// ── everything the coordinator owns ──────────────────────────────────────────
-
+// ── tokens: the Bundled token_list_module (#148) ─────────────────────────────
+//
+// THE THIRD MODULE THIS VARIANT REACHES BY NAME, and the SIMPLEST of the three:
+// one call, no configure first. An unconfigured token_list already serves the
+// Uniswap default list compiled into its binary, so a user's first tap on this
+// tab reads 1709 shipped rows and issues NO NETWORK I/O — which is the whole
+// reason the tab can be answered from a phone at all. Fetching the live lists is
+// `refresh_now`, it goes through that module's fail-closed proxy, and nothing
+// here schedules it: a page must not decide when a device reaches the network.
+//
+// WHY NOT ensureChainConfig FIRST, as a balance and a price both do. Those two
+// end in an RPC round trip that eth_rpc has to have an endpoint for. A token
+// list is metadata: token_list holds it, keyed by chain id, and asks nobody.
 void WalletUiWebBackend::loadTokens(int chainId)
 {
-    Q_UNUSED(chainId)
-    refuse(QStringLiteral("Token lists"), QStringLiteral("token_list_module"));
-    setTokensJson(QStringLiteral("{\"tokens\":[]}"));
+    // One read in flight, superseded by the next — the same epoch shape the two
+    // fan-outs above use, and needed here for the same reason even though this
+    // is a single call: the view has one Tokens tab, so a reply for the chain
+    // the user has just navigated away from must not repaint it.
+    const quint64 epoch = ++m_tokensEpoch;
+    setStatusText(QStringLiteral("Loading tokens…"));
+    announce(QStringLiteral("loadTokens(%1): %2").arg(chainId).arg(doorState()));
+
+    logos::web::callModuleAsync(
+        kTokenList, QStringLiteral("get_tokens"), QJsonArray{ chainId },
+        [this, epoch, chainId](const logos::web::ModuleCallResult& res) {
+            if (epoch != m_tokensEpoch)
+                return;
+
+            announce(QStringLiteral("get_tokens(%1) -> ok=%2 %3")
+                         .arg(chainId)
+                         .arg(res.ok ? "yes" : "no")
+                         .arg(res.ok ? QStringLiteral("%1 byte(s)").arg(res.value.toString().size())
+                                     : res.error));
+
+            const QJsonObject reply = replyOf(res);
+            QJsonArray tokens;
+            QString failure;
+            if (callSucceeded(res, reply))
+                tokens = reply.value(QStringLiteral("tokens")).toArray();
+            else
+                failure = refusalReason(res, reply);
+
+            // PUBLISHED EITHER WAY, and empty on a failure. The tab shows one
+            // chain at a time, so leaving the previous chain's rows up under a
+            // chain that did not answer would be wrong with nothing to see.
+            QJsonObject root;
+            root.insert(QStringLiteral("tokens"), tokens);
+            setTokensJson(jsonText(root));
+
+            if (failure.isEmpty())
+                setStatusText(QStringLiteral("%1 token(s) on chain %2")
+                                  .arg(tokens.size())
+                                  .arg(chainId));
+            else
+                setStatusText(QStringLiteral("token_list_module refused chain %1: %2")
+                                  .arg(chainId)
+                                  .arg(failure));
+        });
 }
 
+// A CUSTOM TOKEN IS A MUTATION, and the `.rep` contract makes it a synchronous
+// bool while the only door out of this image is asynchronous. So `true` here
+// means THE ASK WAS TAKEN, not that it was stored — the outcome arrives on the
+// status line, which is the same channel the view reads for every other result
+// and the only one the QML dialog actually looks at.
+//
+// What IS answered here is what this image can see for itself: a document with
+// no address or no chain is refused without a round trip, because
+// `add_custom_token` answers a bare bool and a `false` from the module would be
+// indistinguishable from a refusal for any other reason.
 bool WalletUiWebBackend::addCustomToken(QString tokenJson)
 {
-    Q_UNUSED(tokenJson)
-    refuse(QStringLiteral("Custom tokens"), QStringLiteral("token_list_module"));
-    return false;
+    const QJsonObject token = QJsonDocument::fromJson(tokenJson.toUtf8()).object();
+    const int chainId = token.value(QStringLiteral("chainId")).toInt();
+    if (token.value(QStringLiteral("address")).toString().isEmpty() || chainId <= 0) {
+        setStatusText(QStringLiteral("A custom token needs a chain and an address"));
+        return false;
+    }
+
+    logos::web::callModuleAsync(
+        kTokenList, QStringLiteral("add_custom_token"), QJsonArray{ jsonText(token) },
+        [this, chainId](const logos::web::ModuleCallResult& res) {
+            // A BARE BOOL, not the `{ok, …}` envelope the readers above parse:
+            // `add_custom_token` answers the value itself, so `stored` is the
+            // whole of what came back and a door failure is the only other
+            // outcome there is.
+            const bool stored = res.ok && res.value.toBool();
+            QString outcome = res.error;
+            if (res.ok)
+                outcome = stored ? QStringLiteral("stored") : QStringLiteral("refused");
+            announce(QStringLiteral("add_custom_token(chain %1) -> %2").arg(chainId).arg(outcome));
+
+            if (!res.ok) {
+                setStatusText(QStringLiteral("token_list_module never answered: %1").arg(res.error));
+                return;
+            }
+            if (!stored) {
+                setStatusText(QStringLiteral("token_list_module did not store the token"));
+                return;
+            }
+            setStatusText(QStringLiteral("Token added"));
+            // RE-READ THE CHAIN THE TOKEN WAS ADDED ON, not whichever the tab
+            // last showed: the row the user has just typed is the one thing
+            // they are looking for, and token_list merges it into that chain's
+            // list under `source: "custom"`.
+            loadTokens(chainId);
+        });
+    return true;
 }
 
 // ── market: the Bundled uniswap_module (#148) ───────────────────────────────
@@ -809,13 +919,17 @@ bool WalletUiWebBackend::addCustomToken(QString tokenJson)
 // endpoint has to be in eth_rpc before the price is asked for, exactly as it
 // does before a balance, and for the reason ensureChainConfig's note gives.
 //
-// WHAT IT PRICES, and why the token list is empty. `token_list_module` has no
-// mobile build, so this image holds no list of a user's ERC-20s and passes
-// `{"tokens":[]}` — which is not an empty question: `get_prices` always reports
-// the chain's native asset, anchored on the chain's stablecoins through the
-// pools it derives offline. So the Market tab shows a real ETH price on every
-// chain uniswap has a deployment for, and gains the user's tokens for free the
-// day token_list crosses (this call then takes the list it publishes).
+// WHAT IT PRICES, and why it still passes an empty token list now that
+// `token_list_module` IS on the phone (#148). What that module publishes is a
+// CATALOGUE — 1709 shipped rows, 401 of them on mainnet — not a watch list, and
+// `get_prices` is a Multicall3 batch: handing it every row would spend a chain's
+// RPC budget pricing tokens nobody holds. `{"tokens":[]}` is not an empty
+// question either: `get_prices` always reports the chain's native asset,
+// anchored on the chain's stablecoins through the pools it derives offline, so
+// the Market tab shows a real ETH price on every chain uniswap has a deployment
+// for. Pricing a user's OWN tokens wants the set they have chosen to watch,
+// which nothing on a phone keeps yet — the coordinator did, and it has no mobile
+// build. Left as it is rather than approximated from the catalogue.
 //
 // `address` IS UNUSED, and that is not an oversight. A price is a property of a
 // chain, not of an account; the account only enters when a price is multiplied
@@ -869,21 +983,17 @@ void WalletUiWebBackend::fetchPrices(int chainId, const QString& symbol)
                          .arg(res.ok ? "yes" : "no")
                          .arg(res.ok ? res.value.toString() : res.error));
 
+            // A refusal is carried in uniswap's own words, which on a chain it
+            // has no deployment for are "no uniswap config for chain <id>" — a
+            // far more useful line than an empty list.
+            const QJsonObject reply = replyOf(res);
             QJsonArray items;
             QString failure;
-            if (!res.ok) {
-                failure = res.error;
-            } else {
-                const QJsonObject reply = replyOf(res);
-                // A refusal is carried in uniswap's own words, which on a chain
-                // it has no deployment for are "no uniswap config for chain
-                // <id>" — a far more useful line than an empty list.
-                if (reply.value(QStringLiteral("ok")).toBool())
-                    items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
-                                       chainId, symbol);
-                else
-                    failure = errorOf(reply);
-            }
+            if (callSucceeded(res, reply))
+                items = priceItems(reply.value(QStringLiteral("prices")).toArray(),
+                                   chainId, symbol);
+            else
+                failure = refusalReason(res, reply);
 
             QJsonObject entry;
             entry.insert(QStringLiteral("chainId"), chainId);

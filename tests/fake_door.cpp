@@ -48,6 +48,14 @@ void answerJson(int i, const QJsonObject& reply)
     deliver(i, res);
 }
 
+void answerBool(int i, bool value)
+{
+    logos::web::ModuleCallResult res;
+    res.ok = true;
+    res.value = QJsonValue(value);
+    deliver(i, res);
+}
+
 void failCall(int i, const QString& error)
 {
     logos::web::ModuleCallResult res;

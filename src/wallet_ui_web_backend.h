@@ -132,6 +132,12 @@ private:
     int m_marketPending = 0;
     QJsonObject m_market;
 
+    // The Tokens tab's read, epoch'd for the same reason the two fan-outs above
+    // are even though it is a single call: the tab shows ONE chain at a time, so
+    // a reply for a chain the user has navigated away from — or the re-read a
+    // custom-token add kicks off — must not repaint it under the newer ask.
+    quint64 m_tokensEpoch = 0;
+
     // The last native balance seen per chain, in WEI, as `fetchBalance` read it
     // off eth_rpc — kept so the Market tab can show a value and not only a
     // price. A CACHE OF AN OBSERVATION, never a source of truth: a chain that

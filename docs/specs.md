@@ -360,7 +360,7 @@ Imports an account from a BIP-39 mnemonic.
   Until #147 this method answered *"Mnemonic import needs keystore_module, which has no
   mobile build"* and made no call at all, while the keystore — itself a `web` variant on
   a phone — was loaded and answering `list_accounts` in the same run. That wording is for
-  a module that really is absent (`wallet_backend_module`, `token_list_module`); a method
+  a module that really is absent (`wallet_backend_module` is the last one); a method
   this variant has not implemented says so in its own words.
 
 ##### `void refreshAccounts()`
@@ -393,6 +393,18 @@ Loads the token list for a chain into `tokensJson`.
 - **`chainId`** — numeric chain id.
 - **Backend call:** `get_tokens(chainId) -> String` → `tokensJson`.
 - **Returns:** nothing.
+- **`web` variant (#148):** no coordinator, so it asks `token_list_module` itself —
+  `get_tokens(chainId)`, and **nothing else**. Unlike a balance or a price there is no
+  `eth_rpc_module.set_chain_config` first: a token list is metadata that module holds,
+  not an RPC round trip. There is no `configure` either — an unconfigured
+  `token_list_module` already serves the Uniswap default list compiled into its binary
+  (1709 rows), so the first tap on this tab performs **no network I/O**. Fetching the
+  live lists is that module's `refresh_now`, which goes through its fail-closed proxy;
+  nothing in this variant schedules it. The rows are republished as `{"tokens":[…]}`
+  and `statusText` becomes `"<n> token(s) on chain <id>"`; a refusal carries
+  token_list's own words (`"token_list_module refused chain <id>: …"`) and **empties**
+  the tab, because it shows one chain at a time and leaving the previous chain's rows
+  up would be wrong with nothing to see.
 
 ##### `bool addCustomToken(QString tokenJson)`
 
@@ -402,6 +414,15 @@ Adds a user-defined custom token to that chain's list.
   `{"chainId":<int>,"address":"0x…","name":"…","symbol":"…","decimals":<int>}`.
 - **Backend call:** `add_custom_token(tokenJson) -> bool`.
 - **Returns:** `true` on success. `statusText` = `"Token added"` / `"Add token failed"`.
+- **`web` variant (#148):** goes to `token_list_module.add_custom_token(tokenJson)`. The
+  only door out of a wasm image is asynchronous while this slot is a synchronous `bool`,
+  so `true` here means **the ask was taken**, not that it was stored; the outcome lands on
+  `statusText`, which is the only channel the QML dialog reads anyway. A document this
+  image can see is wrong — no `address`, or no chain — is refused **here**, without a
+  round trip (`"A custom token needs a chain and an address"`), because
+  `add_custom_token` answers a bare bool and a `false` from the module would be
+  indistinguishable from any other refusal. On success the chain **the token was added
+  on** is re-read, so the new row is visible without a second tap.
 
 ---
 
@@ -420,9 +441,12 @@ Kicks off the per-chain price fan-out for the account's held tokens.
 - **`web` variant (#148):** no coordinator, so it asks `uniswap_module` itself — one
   `get_prices(chainId, {"tokens":[]})` per configured chain, each preceded by the same
   `eth_rpc_module.set_chain_config` step a balance takes (uniswap's price *is* a Multicall3
-  `eth_call` issued back through eth_rpc). The token list is empty because
-  `token_list_module` has no mobile build; `get_prices` still reports the chain's **native**
-  asset, anchored in USD through the chain's stablecoins, and the item carries `valueUsd`
+  `eth_call` issued back through eth_rpc). The token list it passes stays empty even now
+  that `token_list_module` is on the phone: what that module publishes is a **catalogue**
+  (1709 rows, 401 of them on mainnet), not a watch list, and `get_prices` is a Multicall3
+  batch — pricing every row would spend a chain's RPC budget on tokens nobody holds.
+  `get_prices` still reports the chain's **native** asset, anchored in USD through the
+  chain's stablecoins, and the item carries `valueUsd`
   when a balance for that chain has already been seen. A chain uniswap has no deployment
   for (Sepolia) contributes its own refusal to `statusText` rather than a silent blank:
   `"Market updated — chain 11155111: no uniswap config for chain 11155111"`.
