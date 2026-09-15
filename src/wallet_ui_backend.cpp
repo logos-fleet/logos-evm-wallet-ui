@@ -28,6 +28,27 @@ bool replyOk(const QString& replyJson)
         .toBool();
 }
 
+// WHY A WALLET NAMES ITSELF CUSTODIAN. Creating an account is Tier D in the
+// keystore: it belongs to the CUSTODIAN, whose built-in default is
+// `evm_keystore_ui`. That module does not exist in this workspace, so with the
+// defaults in force the New-account dialog would refuse for ever.
+//
+// ADDED TO THE SET, NOT PUT IN PLACE OF IT. `configure` is TOTAL — a role this
+// document does not name is held by NOBODY — so naming only this module would
+// revoke `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in the same
+// call. A role is a set precisely so a second holder can be added, and that is
+// all this adds. The `web` variant sends the same document; the two are
+// separate images with no shared translation unit, so they must stay in step by
+// hand.
+QString custodianRoles()
+{
+    QJsonObject roles;
+    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("custodians"),
+                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
+    return jsonText(roles);
+}
+
 } // namespace
 
 void WalletUiBackend::onContextReady()
@@ -84,7 +105,9 @@ QString WalletUiBackend::testEndpoint(int chainId)
 
 QString WalletUiBackend::createAccount(QString passphrase, QString label)
 {
+    // Accepted and dropped — see `createAccount` in wallet_ui.rep.
     Q_UNUSED(label)
+
     // STRAIGHT TO THE KEYSTORE, not through the coordinator. `create_account` left
     // `wallet_backend_module`'s contract when account mutation became Tier D: a
     // wallet backend requests signatures and reads which accounts exist, and a
@@ -93,22 +116,15 @@ QString WalletUiBackend::createAccount(QString passphrase, QString label)
     // keystore itself — `keystore_module` is already one of this module's declared
     // dependencies, so this is one hop rather than three.
     //
-    // Tier D belongs to the CUSTODIAN, whose built-in default is `evm_keystore_ui`.
-    // That module does not exist in this workspace, so with the defaults in force
-    // the New-account dialog would refuse for ever. This adds this module to the
-    // custodian SET — `configure` is TOTAL, so naming only this one would revoke
-    // `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in the same call,
-    // and a role is a set precisely so a second holder can be added.
-    QJsonObject roles;
-    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
-    roles.insert(QStringLiteral("custodians"),
-                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
-    const QString configured = modules().keystore_module.configure(jsonText(roles));
+    // TAKE THE ROLE, THEN MUTATE: the mutation is refused until the role is in
+    // force, so a refusal here is reported instead of asking for the account.
+    const QString configured = modules().keystore_module.configure(custodianRoles());
     if (!replyOk(configured)) {
         setStatusText(QStringLiteral("keystore_module refused configure"));
         return configured;
     }
-    // The acknowledgement is the method's point, not a formality: an unrelated
+
+    // THE ACKNOWLEDGEMENT IS THE METHOD'S POINT, not a formality: an unrelated
     // account is a key no recovery phrase covers, and the keystore refuses to mint
     // one unless the caller has said so. The New-account dialog IS that choice.
     QJsonObject params;

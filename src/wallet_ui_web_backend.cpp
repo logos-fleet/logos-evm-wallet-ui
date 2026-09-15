@@ -78,14 +78,41 @@ void announce(const QString& what)
     qInfo().noquote() << QStringLiteral("[wallet_ui web] %1").arg(what);
 }
 
+// Every call across the door carries JSON as TEXT, so a structure is rendered
+// on the way out exactly as `replyOf` parses one on the way in. One name for
+// both shapes: which of the two is being rendered is never the interesting part.
 QString jsonText(const QJsonObject& obj)
 {
     return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
 }
 
-QString compact(const QJsonArray& arr)
+QString jsonText(const QJsonArray& arr)
 {
     return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+// WHY A WALLET NAMES ITSELF CUSTODIAN AT ALL. Creating an account is Tier D in
+// the keystore: it belongs to the CUSTODIAN, whose built-in default is
+// `evm_keystore_ui`. That module does not exist in this workspace and certainly
+// does not run on a phone, so with the defaults in force the New-account dialog
+// would answer "not authorized" for ever. Until a keystore UI ships, this wallet
+// is the only surface a user can create an account from, and it says so out loud
+// rather than by being silently admitted.
+//
+// ADDED TO THE SET, NOT PUT IN PLACE OF IT. `configure` is TOTAL — a role this
+// document does not name is held by NOBODY — so naming only this module would
+// revoke `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in the same
+// call. A role is a set precisely so a second holder can be added, and that is
+// all this adds. The desktop variant sends the same document; the two are
+// separate images with no shared translation unit, so they must stay in step by
+// hand.
+QString custodianRoles()
+{
+    QJsonObject roles;
+    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("custodians"),
+                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
+    return jsonText(roles);
 }
 
 // The two flags every startup line and every outbound call is announced with,
@@ -470,38 +497,21 @@ void WalletUiWebBackend::claimCustody(std::function<void()> then)
                                     "custodians %3")
                          .arg(who.value(QStringLiteral("kind")).toString(),
                               who.value(QStringLiteral("identity")).toString(),
-                              compact(who.value(QStringLiteral("custodians")).toArray())));
+                              jsonText(who.value(QStringLiteral("custodians")).toArray())));
             takeCustodianRole(then);
         });
 }
 
 void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
 {
-    // WHY A WALLET NAMES ITSELF CUSTODIAN AT ALL. Creating an account is Tier D
-    // in the keystore: it belongs to the CUSTODIAN, whose built-in default is
-    // `evm_keystore_ui`. That module does not exist in this workspace and
-    // certainly does not run on a phone, so with the defaults in force the New
-    // account dialog would answer "not authorized" for ever. Until a keystore UI
-    // ships, this wallet is the only surface a user can create an account from,
-    // and it says so out loud rather than by being silently admitted.
-    //
-    // ADDED TO THE SET, NOT PUT IN PLACE OF IT. `configure` is TOTAL — a role the
-    // document does not name is held by NOBODY — so naming only this module
-    // would revoke `evm_keystore_ui`'s custody and `evm_signer_ui`'s approval in
-    // the same call. A role is a set precisely so a second holder can be added,
-    // and that is all this does.
-    QJsonObject roles;
-    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
-    roles.insert(QStringLiteral("custodians"),
-                 QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
     logos::web::callModuleAsync(
-        kKeystore, QStringLiteral("configure"), QJsonArray{ jsonText(roles) },
+        kKeystore, QStringLiteral("configure"), QJsonArray{ custodianRoles() },
         [this, then](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (keystoreRefused(QStringLiteral("configure"), res, reply))
                 return;
             announce(QStringLiteral("custodians are now %1")
-                         .arg(compact(reply.value(QStringLiteral("custodians")).toArray())));
+                         .arg(jsonText(reply.value(QStringLiteral("custodians")).toArray())));
             then();
         });
 }
