@@ -29,6 +29,11 @@ class WalletUi
     // covers. It is the only kind this wallet can make, because it holds no
     // seed — `keystore_module.create_unrelated_account`, which is Tier D and
     // therefore needs this module named a custodian first.
+    //
+    // `label` is ACCEPTED AND DROPPED by both variants. It used to reach
+    // `labels.json` through `wallet_backend_module.create_account`, which no
+    // longer exists; nothing has taken over storing it, so the New-account
+    // dialog's Label field is inert until something does.
     SLOT(QString createAccount(QString passphrase, QString label))
     SLOT(QString importMnemonic(QString phraseJson, QString label))
     SLOT(void refreshAccounts())

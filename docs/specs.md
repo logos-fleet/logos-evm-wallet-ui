@@ -213,7 +213,7 @@ the result".
 | `setProxyConfig` | `set_proxy_config(proxyJson)` | `proxyStatus`, `statusText` |
 | `setChains` | `set_chains(chainsJson)`; on success `get_chains()` | `chainsJson`, `statusText` |
 | `testEndpoint` | `test_endpoint(chainId)` | — (returns to caller) |
-| `createAccount` | `create_account(passphrase, label)`; then `refreshAccounts()` | `accountsJson`, `statusText` |
+| `createAccount` | **not the backend** — `keystore_module.configure(roles)`, then `keystore_module.create_unrelated_account(params)`, then `refreshAccounts()` | `accountsJson`, `statusText` |
 | `importMnemonic` | `import_mnemonic(phraseJson, label)`; then `refreshAccounts()` | `accountsJson`, `statusText` |
 | `refreshAccounts` | `list_accounts()` | `accountsJson` |
 | `sendStatus` | `send_status(requestId)` — polled every 1s by the QML Timer while `pendingRequestId != ""` | `pendingRequestId` (cleared on `done`/`declined`), `statusText`, `historyJson` (on `done`, via `refreshHistory`) |
@@ -313,13 +313,28 @@ key material is held inside `keystore_module`.
 
 ##### `QString createAccount(QString passphrase, QString label)`
 
-Creates a brand-new account in the keystore.
+Creates a brand-new **unrelated** account — a key no recovery phrase covers, which is the
+only kind this wallet can mint because it holds no seed.
 
 - **`passphrase`** — passphrase that encrypts the new key at rest.
-- **`label`** — human-friendly label attached to the account.
-- **Backend call:** `create_account(passphrase, label) -> String`; then `refreshAccounts()`.
-- **Returns:** backend JSON describing the new account (address + label). `statusText` =
-  `"Account created"`.
+- **`label`** — accepted and **dropped**. It used to reach `labels.json` through the
+  backend's `create_account`, which no longer exists; nothing stores it today.
+- **Keystore calls, in order and CHAINED** (not through `wallet_backend_module`, which gave
+  account mutation up when it became Tier D):
+  1. `keystore_module.configure(rolesJson)` — creating an account belongs to the
+     **custodian**, whose built-in default `evm_keystore_ui` does not exist in this
+     workspace. `configure` is TOTAL, so the document names the full set:
+     `{"approvers": "evm_signer_ui", "custodians": ["evm_keystore_ui", "wallet_ui"]}` —
+     adding this module rather than replacing the defaults.
+  2. `keystore_module.create_unrelated_account({passphrase, acknowledgeUnrecoverable: true})`
+     — the keystore refuses to mint an unrecoverable key unless the caller acknowledges it,
+     and the New-account dialog *is* that acknowledgement.
+
+  The `web` variant additionally asks `keystore_module.caller_identity()` first and announces
+  the answer: Tier D admits a plainly named module only, and on a phone there is no other way
+  to see which identity the keystore assigned.
+- **Returns:** the keystore JSON for the new account, or the refusal from whichever of the
+  two calls failed. `statusText` = `"Account created"` or `"Account creation refused"`.
 
 ##### `QString importMnemonic(QString phraseJson, QString label)`
 
@@ -728,11 +743,13 @@ link on the PR.
 
 ## Security & invariants
 
-- **No keys in the UI, and no signing anywhere in the wallet.** Account creation and import
-  delegate to `keystore_module` via the backend (`create_account`, `import_mnemonic`). There
+- **No keys in the UI, and no signing anywhere in the wallet.** Import delegates to
+  `keystore_module` via the backend (`import_mnemonic`); account creation goes to
+  `keystore_module` directly (`configure` + `create_unrelated_account`), because the backend
+  gave that method up when account mutation became Tier D. There
   is no `unlock`/`lock` and no `sign_*` left to call: `send_native`/`send_erc20` call
   `keystore_module.request_approval` and park the job, and a human approves the signature in
-  the separate Signer app (`signer_ui`, the keystore's default approver) — the wallet never
+  the separate Signer app (`evm_signer_ui`, the keystore's default approver) — the wallet never
   takes a signing password, only the passphrase for an account it is creating or importing.
   Private key material never crosses the bridge into the UI — the UI only ever sees
   addresses, status flags, approval request ids, and tx hashes.
