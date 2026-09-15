@@ -151,6 +151,39 @@ QString accepted()
     return jsonText(out);
 }
 
+// The other envelope: the ask was NOT taken, and this is why. Shared by
+// `refuse()` — which says a module is missing — and by the checks a method
+// makes on its own arguments, which say nothing about any module at all.
+QString failed(const QString& why)
+{
+    QJsonObject out;
+    out.insert(QStringLiteral("ok"), false);
+    out.insert(QStringLiteral("error"), why);
+    return jsonText(out);
+}
+
+// THE TWO THINGS THAT HAVE TO BE TRUE for a call to have worked: the door
+// delivered it, and the module said yes. Read together because either one alone
+// is a refusal, and a reply read as a value when `ok` was false is the mistake
+// this exists to stop.
+bool callSucceeded(const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return res.ok && reply.value(QStringLiteral("ok")).toBool();
+}
+
+// WHY IT DID NOT, ON THE PAGE'S CONSOLE, and the reason handed back for the
+// caller to put on the status line. A call that never arrived and one the module
+// turned down are the same outcome to the caller but not the same reason, so the
+// reason is taken from whichever it was — here, once, because the callers differ
+// only in what they say afterwards.
+QString announceKeystoreRefusal(const QString& method, const logos::web::ModuleCallResult& res,
+                        const QJsonObject& reply)
+{
+    const QString why = res.ok ? errorOf(reply) : res.error;
+    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    return why;
+}
+
 } // namespace
 
 WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
@@ -271,16 +304,24 @@ void WalletUiWebBackend::publishChains()
     setChainsJson(jsonText(root));
 }
 
+// ONLY FOR A MODULE THAT REALLY IS NOT HERE. `wallet_backend_module` and
+// `token_list_module` have no mobile Bare build, which is why this variant talks
+// to `eth_rpc_module` and `uniswap_module` directly and cannot serve sends, fee
+// estimation, history or token lists at all.
+//
+// IT IS NOT THE ANSWER TO "THIS METHOD IS NOT IMPLEMENTED YET", and #147 is what
+// that mistake costs: `importMnemonic` refused with these words while
+// `keystore_module` — a `web` variant on a phone, loaded and answering
+// `list_accounts` in the same run — was right there. A reader was sent looking
+// for a missing build that was never missing. A method this variant has simply
+// not got to says so in its own words; only a missing module comes through here.
 QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 {
     const QString message =
         QStringLiteral("%1 needs %2, which has no mobile build — the `web` variant "
                        "does accounts, balances and prices").arg(what, module);
     setStatusText(message);
-    QJsonObject out;
-    out.insert(QStringLiteral("ok"), false);
-    out.insert(QStringLiteral("error"), message);
-    return jsonText(out);
+    return failed(message);
 }
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -480,14 +521,11 @@ bool WalletUiWebBackend::keystoreRefused(const QString& method,
                                          const logos::web::ModuleCallResult& res,
                                          const QJsonObject& reply)
 {
-    if (res.ok && reply.value(QStringLiteral("ok")).toBool())
+    if (callSucceeded(res, reply))
         return false;
-    // A call that never arrived and one the module turned down are the same
-    // outcome to the caller but not the same reason, so the reason is taken from
-    // whichever it was. The same words then go to the console and to the view's
-    // status line: a device run reads the first and a human reads the second.
-    const QString why = res.ok ? errorOf(reply) : res.error;
-    announce(QStringLiteral("keystore_module refused %1: %2").arg(method, why));
+    // The same words go to the console and to the view's status line: a device
+    // run reads the first and a human reads the second.
+    const QString why = announceKeystoreRefusal(method, res, reply);
     setStatusText(QStringLiteral("keystore_module: %1").arg(why));
     return true;
 }
@@ -529,11 +567,95 @@ void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
         });
 }
 
+// IMPORTING A SEED PHRASE IS THE KEYSTORE'S OWN METHOD, and this variant asks
+// for it exactly as it asks for a new account (#147).
+//
+// THE DESKTOP GOES THROUGH THE COORDINATOR AND THIS DOES NOT, which is the only
+// real difference between the two. `wallet_backend_module.import_mnemonic`
+// forwards the phrase document to `keystore_module.import_mnemonic` unchanged
+// and then keeps `address -> label` in a labels.json of its own; there is no
+// coordinator here and no such file, so the phrase goes straight to the keystore
+// and the LABEL goes where this variant can actually put it — the keystore's own
+// label store, which `get_labels` reads back.
+//
+// TIER D, so the same claim-then-mutate chain `createAccount` runs: importing a
+// key belongs to the custodian, and the role has to be in force before the
+// mutation is asked for.
 QString WalletUiWebBackend::importMnemonic(QString phraseJson, QString label)
 {
-    Q_UNUSED(phraseJson)
-    Q_UNUSED(label)
-    return refuse(QStringLiteral("Mnemonic import"), kKeystore);
+    // The document the view sends IS the keystore's params document —
+    // `{ phrase, accountIndex, password }` from the Advanced tab, and every
+    // optional field `import_mnemonic` understands (`passphrase`, `storage`,
+    // `bip44Account`, `groupLabel`, …) if a caller sends one. Forwarded whole
+    // rather than rebuilt field by field, so a keystore that grows a parameter
+    // does not need this file edited to pass it.
+    const QJsonObject params = QJsonDocument::fromJson(phraseJson.toUtf8()).object();
+
+    // ASKED AND ANSWERED HERE: a missing phrase is this call's own defect, not a
+    // module's absence and not the keystore's refusal to look at. Saying so
+    // without a round trip is both faster and truer than letting the keystore
+    // answer "invalid mnemonic" for an empty string.
+    if (params.value(QStringLiteral("phrase")).toString().trimmed().isEmpty()) {
+        const QString why = QStringLiteral("Import needs a seed phrase");
+        announce(why);
+        setStatusText(why);
+        return failed(why);
+    }
+
+    setStatusText(QStringLiteral("Importing account…"));
+    // The password is lifted out here rather than read off `params` again in the
+    // reply: the label call needs it, and the phrase does not have to be carried
+    // into a second lambda to get it there.
+    const QString password = params.value(QStringLiteral("password")).toString();
+    claimCustody([this, params, label, password]() {
+        logos::web::callModuleAsync(
+            kKeystore, QStringLiteral("import_mnemonic"), QJsonArray{ jsonText(params) },
+            [this, label, password](const logos::web::ModuleCallResult& res) {
+                const QJsonObject reply = replyOf(res);
+                if (keystoreRefused(QStringLiteral("import_mnemonic"), res, reply))
+                    return;
+                const QString address = reply.value(QStringLiteral("address")).toString();
+                announce(QStringLiteral("imported %1 at %2")
+                             .arg(address, reply.value(QStringLiteral("path")).toString()));
+                setStatusText(QStringLiteral("Account imported"));
+                labelAccount(address, label, password);
+            });
+    });
+    return accepted();
+}
+
+// The label the user typed beside the phrase, put where this variant can keep
+// it, and then the account list — CHAINED, for the same reason every other pair
+// of calls here is: two issued in one turn are answered in whatever order the
+// container finishes them.
+//
+// A REFUSED LABEL IS NOT A FAILED IMPORT. The key is in the keystore either way
+// and losing sight of it because a name did not stick would be the worse
+// outcome, so this reports the refusal beside "Account imported" rather than in
+// place of it, and goes on to re-read the list.
+void WalletUiWebBackend::labelAccount(const QString& address, const QString& label,
+                                      const QString& password)
+{
+    if (label.isEmpty() || address.isEmpty()) {
+        refreshAccounts();
+        return;
+    }
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("set_label"), QJsonArray{ address, label, password },
+        [this, address, label](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (callSucceeded(res, reply)) {
+                announce(QStringLiteral("labelled %1 \"%2\"").arg(address, label));
+            } else {
+                // NOT `keystoreRefused`: that one replaces the status line with
+                // the keystore's reason, which here would unsay "Account
+                // imported" for a key that is in the keystore all the same.
+                const QString why =
+                    announceKeystoreRefusal(QStringLiteral("set_label"), res, reply);
+                setStatusText(QStringLiteral("Account imported — label not set: %1").arg(why));
+            }
+            refreshAccounts();
+        });
 }
 
 QString WalletUiWebBackend::sendStatus(QString requestId)

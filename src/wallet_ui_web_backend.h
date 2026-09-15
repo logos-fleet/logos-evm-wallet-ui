@@ -177,6 +177,13 @@ private:
     // runs only when the role was taken — a refusal here means the mutation
     // would be refused too, and saying so once is better than saying it twice.
     void claimCustody(std::function<void()> then);
+    // The last link of an import's chain: name the account, then re-read the
+    // list. Split out of importMnemonic for the same reason takeCustodianRole is
+    // split out of claimCustody — a third nested lambda is not a sequence a
+    // reader can follow. A blank label skips straight to the list, and a refused
+    // one is reported without unsaying "Account imported".
+    void labelAccount(const QString& address, const QString& label,
+                      const QString& password);
     // The second link of that chain: the `configure` call itself. Split out so
     // claimCustody reads as the two questions it asks — "who am I here?" and
     // "may I mutate?" — rather than as two nested lambdas.

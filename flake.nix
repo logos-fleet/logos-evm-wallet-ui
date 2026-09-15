@@ -17,9 +17,51 @@
   };
 
   outputs = inputs@{ logos-module-builder, ... }:
-    logos-module-builder.lib.mkLogosQmlModule {
-      src = ./.;
-      configFile = ./metadata.json;
-      flakeInputs = inputs;
+    let
+      nixpkgs = logos-module-builder.inputs.nixpkgs;
+      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+
+      module = logos-module-builder.lib.mkLogosQmlModule {
+        src = ./.;
+        configFile = ./metadata.json;
+        flakeInputs = inputs;
+      };
+    in
+    module // {
+      # ADDED TO the builder's checks, never in place of them: mkLogosQmlModule
+      # publishes this module's integration test under the same attribute, and
+      # replacing the set would drop it silently. Merged at BOTH levels for that
+      # reason — the builder keys its checks over its own systems list, which
+      # carries the x86_64-windows pseudo-system this check has no native
+      # nixpkgs for, so those keys pass through untouched.
+      #
+      # `web-backend` drives the `web` variant's backend natively against a
+      # recorded door — see nix/web-backend-test.nix for what that can and
+      # cannot say.
+      #
+      # A SKIP THAT SAYS SO when the pinned logos-module-builder has no `wasm/`
+      # directory. That header is the ONE thing this check needs from the
+      # builder, and a pin from before the Wasm host existed does not have it —
+      # the same pin that publishes no `web` variant for this module at all. A
+      # check that failed there would be reporting a pin rollout as a defect;
+      # one that was simply absent would be a green run with a missing test.
+      checks = (module.checks or { }) // nixpkgs.lib.genAttrs systems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          door = "${logos-module-builder}/wasm";
+        in
+        (module.checks.${system} or { }) // {
+          web-backend =
+            if builtins.pathExists "${door}/logos_web_module_call.h"
+            then import ./nix/web-backend-test.nix { inherit pkgs door; src = ./.; }
+            else pkgs.runCommand "wallet-ui-web-backend-tests-skipped" { } ''
+              echo "SKIP: web-backend -- this logos-module-builder pin has no"
+              echo "      wasm/logos_web_module_call.h, so it publishes no \`web\`"
+              echo "      variant for this module either. Run through the workspace"
+              echo "      flake: ws test logos-evm-wallet-ui --local logos-module-builder"
+              mkdir -p $out
+              echo skipped > $out/result
+            '';
+        });
     };
 }
