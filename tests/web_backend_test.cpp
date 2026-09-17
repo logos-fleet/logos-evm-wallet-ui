@@ -24,6 +24,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLatin1String>
+#include <QStringList>
 #include <QString>
 
 #include <cstdio>
@@ -2162,11 +2164,252 @@ void aShieldWithAnUnencodableAmountIsRefusedWithoutAsking()
              "and the refusal reaches the panel the user is looking at");
 }
 
+// ── THE LINES A DEVICE RUN IS READ BY (logos-workspace#250, criterion 1) ─────
+//
+// The three screens this issue was reported against cannot be pressed by a
+// person on the venue's iPad: `idb` input reaches nothing under Xcode 27 and a
+// `web` variant's UI is pixels in a canvas, so the Shell drives the page from
+// INSIDE (`--drive web-input:<flow>`) and the only verdict such a flow can give
+// is a line the page printed. Basecamp's WebDriveFlows reads ONE JSON FIELD off
+// ONE line, so a screen whose answer is only prose — or only a property no line
+// carries — cannot be asserted on a device at all.
+//
+// Which is what the History and Settings tabs were: `refreshHistory` published
+// nothing on the way back, and the proxy's answer was a sentence. The refusals
+// were readable and the successes were not, so a device run could show that the
+// wallet stopped blaming a missing build and not that either screen WORKED.
+// Both now say what happened in the shape a driver reads, and `refreshAccounts`
+// does too because a history flow has to wait for the account it asks about.
+QStringList announced;
+
+QtMessageHandler previousHandler = nullptr;
+
+void collectAnnouncements(QtMsgType type, const QMessageLogContext& ctx, const QString& text)
+{
+    if (text.startsWith(QLatin1String("[wallet_ui web] ")))
+        announced << text;
+    if (previousHandler)
+        previousHandler(type, ctx, text);
+}
+
+// The object on the first announced line carrying `marker`, the way a driver's
+// watch reads one: everything from the first `{`.
+std::optional<QJsonObject> announcedObject(const QString& marker)
+{
+    for (const QString& line : announced) {
+        if (!line.contains(marker))
+            continue;
+        const int brace = line.indexOf(QLatin1Char('{'));
+        if (brace < 0)
+            continue;
+        return QJsonDocument::fromJson(line.mid(brace).toUtf8()).object();
+    }
+    return std::nullopt;
+}
+
+bool nothingAnnounced(const QString& marker)
+{
+    for (const QString& line : announced)
+        if (line.contains(marker))
+            return false;
+    return true;
+}
+
+// The History tab's answer, on the console, with the two things a run needs off
+// it: WHICH account was asked about and HOW MANY rows came back. A `rows` of 0
+// is an answer — "No transactions yet" — and a refusal publishes no such line
+// at all, which is the difference the next case is about.
+void theHistoryAnswerIsOnTheConsole()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.refreshHistory(QStringLiteral("0xabc"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"), QStringLiteral("get_history")))
+        return;
+    fake_door::answerJson(0, QJsonObject{
+        { "ok", true },
+        { "history", QJsonArray{ QJsonObject{ { "kind", "send" },
+                                              { "status", "confirmed" },
+                                              { "hash", "0xdead" } } } } });
+
+    const std::optional<QJsonObject> said = announcedObject(QStringLiteral("history updated:"));
+    check(said.has_value(),
+          QStringLiteral("the history reply was never announced, so a device run cannot "
+                         "read it; the page said: %1").arg(announced.join(QLatin1String(" | "))));
+    if (!said)
+        return;
+    check(said->value(QStringLiteral("rows")).toInt() == 1,
+          QStringLiteral("the announced history did not carry its row count: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+    check(said->value(QStringLiteral("address")).toString() == QStringLiteral("0xabc"),
+          QStringLiteral("the announced history did not carry the account it is for: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("the history reply is announced with its account and its row count");
+}
+
+// ...AND A REFUSAL PUBLISHES NO SUCH LINE. A watch that settled on a refused
+// history would be a device run reporting the tab works because the wallet
+// mentioned it — the exact mistake #250 is about.
+void aRefusedHistoryAnnouncesNoAnswer()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.refreshHistory(QStringLiteral("0xabc"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"), QStringLiteral("get_history")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", false },
+                                          { "error", "no record for that account" } });
+
+    check(nothingAnnounced(QStringLiteral("history updated:")),
+          QStringLiteral("a refused history still announced an answer: %1")
+              .arg(announced.join(QLatin1String(" | "))));
+
+    if (failures == before)
+        pass("a refused history announces no answer for a driver to read");
+}
+
+// The Settings tab's answer, on the console: WHAT was applied, not that
+// something was. `proxyRequired` is on the line because it is the field that
+// decides what happens when the proxy is unreachable.
+void theAppliedProxyIsOnTheConsole()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.setProxyConfig(QStringLiteral(
+        R"({"proxy":"socks5h://127.0.0.1:9050","proxyRequired":false})"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"),
+                    QStringLiteral("set_proxy_config")))
+        return;
+    fake_door::answerBool(0, true);
+
+    const std::optional<QJsonObject> said = announcedObject(QStringLiteral("proxy applied:"));
+    check(said.has_value(),
+          QStringLiteral("the applied proxy was never announced, so a device run cannot "
+                         "read it; the page said: %1").arg(announced.join(QLatin1String(" | "))));
+    if (!said)
+        return;
+    check(said->value(QStringLiteral("proxy")).toString()
+              == QStringLiteral("socks5h://127.0.0.1:9050"),
+          QStringLiteral("the announced proxy line does not carry the proxy: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+    check(said->contains(QStringLiteral("proxyRequired")),
+          QStringLiteral("the announced proxy line drops the fail-closed flag: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("an applied proxy is announced with the document that was applied");
+}
+
+// ...and a refused one announces nothing to read as applied.
+void aRefusedProxyAnnouncesNoApplication()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.setProxyConfig(QStringLiteral(R"({"proxy":"nonsense","proxyRequired":true})"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"),
+                    QStringLiteral("set_proxy_config")))
+        return;
+    fake_door::answerBool(0, false);
+
+    check(nothingAnnounced(QStringLiteral("proxy applied:")),
+          QStringLiteral("a refused proxy still announced an application: %1")
+              .arg(announced.join(QLatin1String(" | "))));
+
+    if (failures == before)
+        pass("a proxy the coordinator refused announces no application");
+}
+
+// THE ACCOUNT LIST, for the step in front of every history run: a flow that
+// imports a seed cannot press `Refresh history` until an account exists, and
+// the button is disabled until one does. `selected` is what the tab will ask
+// about, so it is what the line carries.
+void theAccountListIsOnTheConsole()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.refreshAccounts();
+    if (!expectCall(0, QStringLiteral("keystore_module"), QStringLiteral("list_accounts")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", true },
+                                          { "accounts", QJsonArray{ "0xabc", "0xdef" } } });
+
+    const std::optional<QJsonObject> said = announcedObject(QStringLiteral("accounts now:"));
+    check(said.has_value(),
+          QStringLiteral("the account list was never announced in a readable shape: %1")
+              .arg(announced.join(QLatin1String(" | "))));
+    if (!said)
+        return;
+    check(said->value(QStringLiteral("count")).toInt() == 2,
+          QStringLiteral("the announced account list did not carry its count: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+    check(said->value(QStringLiteral("selected")).toString() == QStringLiteral("0xabc"),
+          QStringLiteral("the announced account list did not carry the account the tabs "
+                         "will ask about: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("the account list is announced with the account the tabs will ask about");
+}
+
+// ...AND AN EMPTY KEYSTORE PUBLISHES NO ACCOUNT TO ASK ABOUT. A device opens
+// this app before any flow has imported anything, so this line is published
+// once for a list with nothing in it. `selected` is null there rather than an
+// empty string: an empty string is a reading, and a gate waiting for an account
+// would settle on the startup list and then press a button the view has
+// disabled. The count still says the keystore answered.
+void anEmptyKeystoreAnnouncesNoSelectedAccount()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.refreshAccounts();
+    if (!expectCall(0, QStringLiteral("keystore_module"), QStringLiteral("list_accounts")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", true }, { "accounts", QJsonArray{} } });
+
+    const std::optional<QJsonObject> said = announcedObject(QStringLiteral("accounts now:"));
+    check(said.has_value(),
+          QStringLiteral("an empty account list was never announced: %1")
+              .arg(announced.join(QLatin1String(" | "))));
+    if (!said)
+        return;
+    check(said->value(QStringLiteral("count")).toInt() == 0,
+          QStringLiteral("the announced empty list did not say so: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+    check(said->value(QStringLiteral("selected")).isNull(),
+          QStringLiteral("an empty keystore announced a selected account a run would "
+                         "settle on: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("an empty keystore announces its count and no account to ask about");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
+    previousHandler = qInstallMessageHandler(collectAnnouncements);
 
     theApproverSetNamesAnApproverThisImageCarries();
     importGoesToTheKeystore();
@@ -2209,6 +2452,12 @@ int main(int argc, char** argv)
     aDeclinedShieldEndsInTheSignersOwnWords();
     aMinedRevertIsReportedAsOne();
     aShieldWithAnUnencodableAmountIsRefusedWithoutAsking();
+    theHistoryAnswerIsOnTheConsole();
+    aRefusedHistoryAnnouncesNoAnswer();
+    theAppliedProxyIsOnTheConsole();
+    aRefusedProxyAnnouncesNoApplication();
+    theAccountListIsOnTheConsole();
+    anEmptyKeystoreAnnouncesNoSelectedAccount();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

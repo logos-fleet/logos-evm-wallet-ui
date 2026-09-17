@@ -433,6 +433,7 @@ Item {
                         Layout.fillWidth: true
                         LogosText { text: "Recent activity"; font.weight: Theme.typography.weightBold; Layout.fillWidth: true }
                         LogosButton {
+                            objectName: "historyRefreshButton"
                             text: "Refresh history"; enabled: root.ready && acctBox.currentText.length > 0
                             onClicked: backend.refreshHistory(acctBox.currentText)
                         }
@@ -466,14 +467,35 @@ Item {
                     width: pages.width - 16
                     spacing: Theme.spacing.small
                     LogosText { text: "Privacy / proxy"; font.weight: Theme.typography.weightBold }
-                    LogosTextField { id: proxyUrl; Layout.fillWidth: true; placeholderText: "socks5h://127.0.0.1:9050" }
-                    LogosCheckbox { id: proxyRequired; text: "Require proxy (fail-closed)" }
+                    // NAMED, because this tab is driven from inside the app on a
+                    // device (logos-workspace#250): `idb` input reaches nothing
+                    // under Xcode 27 and a `web` variant's UI is pixels in a
+                    // canvas, so the Shell finds a field by its objectName —
+                    // Qt for WebAssembly publishes a text editor with no
+                    // accessible name at all.
+                    LogosTextField { id: proxyUrl; objectName: "proxyUrlField"; Layout.fillWidth: true; placeholderText: "socks5h://127.0.0.1:9050" }
+                    LogosCheckbox { id: proxyRequired; objectName: "proxyRequiredBox"; text: "Require proxy (fail-closed)" }
                     LogosButton {
+                        objectName: "proxyApplyButton"
                         text: "Apply proxy"; enabled: backend !== null
                         onClicked: backend.setProxyConfig(JSON.stringify({
                             proxy: proxyUrl.text.length ? proxyUrl.text : null,
                             proxyRequired: proxyRequired.checked
                         }))
+                    }
+                    // WHAT THE COORDINATOR DID WITH IT. `proxyStatus` is a PROP
+                    // this backend has always published and nothing rendered:
+                    // pressing Apply changed the screen in no way at all,
+                    // whether the setting was applied, refused, or — before
+                    // #250 — never asked for. It is the one line on this tab
+                    // that says which of the three happened.
+                    LogosText {
+                        objectName: "proxyStatusText"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        text: backend ? backend.proxyStatus : ""
+                        visible: text.length > 0
+                        color: Theme.palette.textSecondary
+                        font.pixelSize: Theme.typography.secondaryText
                     }
                 }
             }
@@ -544,6 +566,12 @@ Item {
                     LogosTextField { id: advAcctPw; objectName: "advAcctPwField"; Layout.fillWidth: true; placeholderText: "Account passphrase"; echoMode: TextInput.Password }
                     RowLayout {
                         LogosButton {
+                            // NAMED, like every other control a device run
+                            // presses (logos-workspace#250): the accessible
+                            // name is matched from the front and this button
+                            // sits under an "Import account (seed phrase)"
+                            // heading, which matches "Import" just as well.
+                            objectName: "advImportButton"
                             text: "Import"; enabled: root.ready && advSeed.text.length > 0
                             onClicked: logos.watch(backend.importMnemonic(JSON.stringify({
                                     phrase: advSeed.text, accountIndex: 0, password: advAcctPw.text
