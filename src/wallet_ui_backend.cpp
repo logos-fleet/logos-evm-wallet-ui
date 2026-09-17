@@ -286,7 +286,10 @@ void WalletUiBackend::refreshPrivateSync()
     setPrivateSyncJson(privateSyncUnavailable());
 }
 
-QString WalletUiBackend::startPrivateSync()
+// Both controls on the Private tab answer the same way here, because both are
+// asking for a module this build does not carry: the surface says `unavailable`
+// and the status line says which module would have served it.
+QString WalletUiBackend::refuseWithoutRailgun()
 {
     setPrivateSyncJson(privateSyncUnavailable());
     setStatusText(kRailgunAbsent);
@@ -294,9 +297,14 @@ QString WalletUiBackend::startPrivateSync()
                                  { QStringLiteral("error"), kRailgunAbsent } });
 }
 
+QString WalletUiBackend::startPrivateSync()
+{
+    return refuseWithoutRailgun();
+}
+
 QString WalletUiBackend::cancelPrivateSync()
 {
     // Nothing is running, so there is nothing to stop — and saying "cancelled"
     // for a walk that never started would be the one answer worse than a refusal.
-    return startPrivateSync();
+    return refuseWithoutRailgun();
 }

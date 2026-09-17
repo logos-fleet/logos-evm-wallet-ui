@@ -108,7 +108,8 @@ private:
     // opens, then asks the keystore for accounts once and stops.
     QTimer m_startup;
     int m_startupTicks = 0;
-    // Attempts spent on the admission race, per ask. See kAdmissionRetries.
+    // Attempts each first ask has spent on the admission race, counted up to
+    // kAdmissionRetries and reset once that ask has been answered.
     int m_accountRetries = 0;
     int m_privateSyncRetries = 0;
 

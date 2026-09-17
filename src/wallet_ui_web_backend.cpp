@@ -37,6 +37,18 @@ const QString kTokenList = QStringLiteral("token_list_module");
 // chain list's `nativeSymbol` is that, and is what the item is labelled with.
 const QString kNativeAsset = QStringLiteral("ETH");
 
+// THE FIVE WORDS `privateSyncJson.sync.state` IS EVER ONE OF, spelled once.
+// They are a contract, not a message: WalletView.qml colours the state label by
+// them and docs/specs.md lists them, so a typo here is a state nothing renders
+// and nothing complains about. Naming them also keeps them apart from the
+// module's own `done` FIELD, which is spelled the same and means something
+// else. See "the private sync" section near the bottom of this file.
+const QString kStateIdle = QStringLiteral("idle");
+const QString kStateRunning = QStringLiteral("running");
+const QString kStateDone = QStringLiteral("done");
+const QString kStateCancelled = QStringLiteral("cancelled");
+const QString kStateUnavailable = QStringLiteral("unavailable");
+
 // How often the startup wait asks whether the page has a channel yet, and how
 // long it waits before saying it has not. A minute: a cold phone launch mounts
 // a webview, fetches a document and instantiates a ~26 MB runtime beside this
@@ -218,8 +230,7 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     // about the accumulator yet, and an empty bar that claimed 0 % would be a
     // guess. The first `sync_status` replaces this the moment the page is
     // admitted.
-    publishPrivateSync(QStringLiteral("idle"), QJsonObject{},
-                       QStringLiteral("Not checked yet."));
+    publishPrivateSync(kStateIdle, QJsonObject{}, QStringLiteral("Not checked yet."));
 
     // AUTOMATIC, AND ONLY AT THE EDGES. The view already picks the first
     // account as soon as one exists (WalletView.qml's `onCountChanged`), and it
@@ -1232,11 +1243,11 @@ void WalletUiWebBackend::refreshPrivateSync()
             // it is the one still asking for windows, and that is what the view
             // needs to decide between a Sync button and a Cancel button.
             if (m_syncRunning) {
-                publishPrivateSync(QStringLiteral("running"), reply);
+                publishPrivateSync(kStateRunning, reply);
                 return;
             }
             const bool done = reply.value(QStringLiteral("done")).toBool();
-            publishPrivateSync(done ? QStringLiteral("done") : QStringLiteral("idle"), reply);
+            publishPrivateSync(done ? kStateDone : kStateIdle, reply);
         });
 }
 
@@ -1252,7 +1263,7 @@ QString WalletUiWebBackend::startPrivateSync()
     m_syncRunning = true;
     m_syncCancelled = false;
     setStatusText(QStringLiteral("Syncing the private balance…"));
-    publishPrivateSync(QStringLiteral("running"), m_syncPlan);
+    publishPrivateSync(kStateRunning, m_syncPlan);
     stepPrivateSync();
     return accepted();
 }
@@ -1286,7 +1297,7 @@ void WalletUiWebBackend::stepPrivateSync()
             if (reply.value(QStringLiteral("done")).toBool()) {
                 m_syncRunning = false;
                 setStatusText(QStringLiteral("Private balance is up to date"));
-                publishPrivateSync(QStringLiteral("done"), reply);
+                publishPrivateSync(kStateDone, reply);
                 return;
             }
             // NOTHING MOVED. The module says so rather than letting a caller
@@ -1295,13 +1306,13 @@ void WalletUiWebBackend::stepPrivateSync()
             if (reply.value(QStringLiteral("stalled")).toBool()) {
                 m_syncRunning = false;
                 publishPrivateSync(
-                    QStringLiteral("idle"), reply,
+                    kStateIdle, reply,
                     QStringLiteral("The sync stopped making progress at block %1. "
                                    "Everything up to there is saved; try again later.")
                         .arg(reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong()));
                 return;
             }
-            publishPrivateSync(QStringLiteral("running"), reply);
+            publishPrivateSync(kStateRunning, reply);
             stepPrivateSync();
         });
 }
@@ -1332,7 +1343,7 @@ QString WalletUiWebBackend::cancelPrivateSync()
                     ? reply.value(QStringLiteral("keptToBlock")).toVariant().toLongLong()
                     : reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong();
             setStatusText(QStringLiteral("Private sync stopped"));
-            publishPrivateSync(QStringLiteral("cancelled"), reply, cancelNote(kept));
+            publishPrivateSync(kStateCancelled, reply, cancelNote(kept));
         });
     return accepted();
 }
@@ -1377,5 +1388,5 @@ void WalletUiWebBackend::privateSyncUnavailable(const QString& method,
     const QString said = QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, why);
     announce(said);
     setStatusText(said);
-    publishPrivateSync(QStringLiteral("unavailable"), QJsonObject{}, QString(), said);
+    publishPrivateSync(kStateUnavailable, QJsonObject{}, QString(), said);
 }

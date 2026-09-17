@@ -807,17 +807,18 @@ void theRetryIsBoundedAndTheLastRefusalIsPublished()
     WalletUiWebBackend backend;
 
     backend.refreshPrivateSync();
-    int i = 0;
-    // Refuse every attempt. Bounded by a call count rather than by a deadline, so
-    // a retry budget that grew would be REPORTED here rather than hanging the run.
-    while (i < 32) {
-        if (i >= fake_door::calls.size())
-            break;
-        fake_door::failCall(i, QStringLiteral("module not found: railgun_module"));
-        ++i;
-        settleUntilCall(i, 3000);
+    // Refuse every attempt, until the backend stops making them. Bounded by a
+    // CALL CEILING rather than by a deadline, so a retry budget that grew would
+    // be REPORTED here rather than hanging the run.
+    const int ceiling = 32;
+    int refused = 0;
+    while (refused < ceiling && refused < fake_door::calls.size()) {
+        fake_door::failCall(refused, QStringLiteral("module not found: railgun_module"));
+        ++refused;
+        settleUntilCall(refused, 3000);
     }
-    check(i < 32, QStringLiteral("the retry never gave up: %1 calls").arg(i));
+    check(refused < ceiling,
+          QStringLiteral("the retry never gave up: %1 calls").arg(refused));
     check(privateSync(backend).value(QStringLiteral("state")).toString()
               == QStringLiteral("unavailable"),
           QStringLiteral("a build with no railgun never reached a verdict: %1")

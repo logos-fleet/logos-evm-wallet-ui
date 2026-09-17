@@ -57,6 +57,10 @@ private:
     // where the decision happens.
     QString trackSend(QString reply);
 
+    // Shared by startPrivateSync/cancelPrivateSync: publish `unavailable` and
+    // return the refusal envelope naming railgun_module.
+    QString refuseWithoutRailgun();
+
 protected:
     // Called once after the framework populates modules()/context.
     void onContextReady() override;

@@ -61,11 +61,39 @@ Item {
     // The one leg of a private send that reports progress. See the Private tab
     // below, and `privateSyncJson` in wallet_ui.rep for the shape.
     readonly property var privateSync: parseField(backend ? backend.privateSyncJson : "", "sync", ({}))
+    // Where Private sits in the tab bar. Named because selectTab, the tab bar
+    // and docs/specs.md all have to quote the same number — see the tab bar
+    // below for why it is APPENDED rather than placed next to Send.
+    readonly property int privateTabIndex: 7
 
     function parseField(json, field, fallback) {
         if (!json) return fallback
         try { var o = JSON.parse(json); return (o && o[field] !== undefined) ? o[field] : fallback }
         catch (e) { return fallback }
+    }
+
+    // The colour the Private tab reads a sync state in. A function rather than a
+    // chain of ternaries in the binding: the states are a closed set (see the
+    // `kState*` constants in wallet_ui_web_backend.cpp), and this is where the
+    // set is matched, one line each.
+    function privateSyncColor(state) {
+        if (state === "unavailable") return Theme.palette.error
+        if (state === "done") return Theme.palette.success
+        if (state === "running") return Theme.palette.warning
+        return Theme.palette.textSecondary
+    }
+
+    // "40%  ·  600 blocks to go  ·  about 6 s left" — joined from the parts that
+    // are actually there, so a plan carrying a percentage but no block count or
+    // no ETA reads as a shorter line rather than one ending in a separator with
+    // nothing after it.
+    function privateSyncProgressLine(sync) {
+        var parts = [sync.percent + "%"]
+        if (sync.blocksRemaining !== undefined)
+            parts.push(sync.blocksRemaining + " blocks to go")
+        if (sync.etaMs != null)
+            parts.push("about " + Math.round(sync.etaMs / 1000) + " s left")
+        return parts.join("  ·  ")
     }
 
     // WHAT THIS VIEW IS RENDERING, on the console, the moment it renders it.
@@ -93,7 +121,7 @@ Item {
         // Opening Private re-reads how far behind the accumulator is. One
         // `eth_blockNumber` and no chain walk, so it is cheap enough to do on
         // every visit and is what stops the page showing a stale percentage.
-        if (tabs.currentIndex === 7 && root.ready && backend)
+        if (tabs.currentIndex === root.privateTabIndex && root.ready && backend)
             backend.refreshPrivateSync()
     }
 
@@ -526,10 +554,7 @@ Item {
                             objectName: "privateSyncState"
                             Layout.fillWidth: true
                             text: root.privateSync.state || "unknown"
-                            color: root.privateSync.state === "unavailable" ? Theme.palette.error
-                                 : root.privateSync.state === "done" ? Theme.palette.success
-                                 : root.privateSync.state === "running" ? Theme.palette.warning
-                                 : Theme.palette.textSecondary
+                            color: root.privateSyncColor(root.privateSync.state)
                         }
                     }
 
@@ -548,12 +573,7 @@ Item {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap
                         font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textSecondary
                         visible: root.privateSync.percent !== undefined
-                        text: root.privateSync.percent + "%  ·  "
-                              + (root.privateSync.blocksRemaining !== undefined
-                                 ? root.privateSync.blocksRemaining + " blocks to go" : "")
-                              + (root.privateSync.etaMs != null
-                                 ? "  ·  about " + Math.round(root.privateSync.etaMs / 1000) + " s left"
-                                 : "")
+                        text: root.privateSyncProgressLine(root.privateSync)
                     }
                     LogosText {
                         objectName: "privateSyncNote"
