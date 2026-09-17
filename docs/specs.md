@@ -233,8 +233,8 @@ the result".
 
 ## Full API reference
 
-The public surface is the QtRO **view contract** in `src/wallet_ui.rep`: **10 properties**
-the QML view reads, and **15 slots** the QML view (or a headless qt-mcp driver) calls. All
+The public surface is the QtRO **view contract** in `src/wallet_ui.rep`: **12 properties**
+the QML view reads, and **20 slots** the QML view (or a headless qt-mcp driver) calls. All
 slots are implemented in `WalletUiBackend` (`src/wallet_ui_backend.cpp`); the corresponding
 backend method's return shape is documented under each.
 
@@ -256,6 +256,7 @@ auto-synced to the QML replica, where the view reads them as `backend.<prop>`.
 | `marketJson` | `QString` | READONLY | JSON `{"ok":true,"address","chains":[{chainId,items:[…]}]}` Uniswap-priced holdings. | `get_market()` |
 | `proxyStatus` | `QString` | READONLY | `"Proxy applied"` / `"Proxy failed"` after a proxy apply. Initial `""`. | `setProxyConfig` |
 | `privateSyncJson` | `QString` | READONLY | JSON `{"sync":{leg,state,percent,blocksRemaining,etaMs,…}}` — the RAILGUN accumulator sync a private send waits on. `state` is `idle` / `running` / `done` / `cancelled` / `unavailable`; the module's own plan fields are passed through unchanged. | `railgun_module.sync_status` / `sync_step` / `sync_cancel` (`web` variant only) |
+| `privateSendJson` | `QString` | READONLY | JSON `{"send":{state,leg,legs:[{name,state}],cancellable,requestId?,userOpHash?,note?,error?}}` — the private send the sync above is one leg of. `legs` is the whole route in order (`sync`, `prove`, `approve`, `broadcast`), each `pending` / `running` / `done` / `skipped` / `cancelled` / `failed`. | `railgun_module.relayed_send` / `relayed_send_status` / `relayed_send_cancel` (`web` variant only) |
 
 ### Slots (UI-callable methods)
 
@@ -529,8 +530,9 @@ Loads the locally-recorded, wallet-originated transactions for an account.
 
 #### Private (RAILGUN)
 
-The three slots behind the Private tab. **Only the `web` variant serves them**; the desktop
-plugin refuses by name (see "Why the desktop half refuses" below).
+The five slots behind the Private tab — a private send, and the accumulator walk in front of
+it. **Only the `web` variant serves them**; the desktop plugin refuses by name (see "Why the
+desktop half refuses" below).
 
 ##### `void refreshPrivateSync()`
 
@@ -589,8 +591,9 @@ Stop asking for windows.
 the half that runs there (`logos-basecamp` ships it as `LOGOS_SHELL_WEB_MODULES=wallet_ui`).
 The desktop plugin talks to `wallet_backend_module`, and the coordinator does not name railgun
 in its dependencies — so there is no private send behind a desktop build and nothing to report
-progress for. It answers `state: "unavailable"` with the module named, in the same shape, so
-the same QML renders both halves.
+progress for. It answers `state: "unavailable"` with the module named, in the same shape —
+including the send's four legs, each `unavailable` rather than `pending`, because `pending`
+would promise a leg that is coming — so the same QML renders both halves.
 
 ##### Why `railgun_module` is NOT in `web.dependencies`
 
@@ -603,15 +606,88 @@ refusal published as `unavailable` with the reason in it. Same shape as the cata
 floor for `token_list_module` (ADR 0009) — a control a user can see refusing, rather than a
 module that silently will not start.
 
+##### `QString startPrivateSend(QString sendJson)`
+
+**A private send, run as its legs** — logos-workspace#235's first clause, on the surface a
+user is looking at.
+
+`sendJson` is `{to, asset, amount, memo?, owner, bundlerUrl}`: `to` is a `0zk…` (private
+transfer) or a `0x…` (unshield), `owner` is the EOA whose signature authorises the relayed
+operation (it pays no gas), `bundlerUrl` is the ERC-4337 bundler. A field that is missing is
+refused **here**, without a round trip and without naming a module — the wallet can see it is
+wrong.
+
+The route, one call outstanding at any moment:
+
+| leg | what runs | how it ends |
+|---|---|---|
+| `sync` | the accumulator walk above, in windows | `done` when the tree reaches the head, **`skipped`** when it was already there |
+| `prove` | `railgun_module.relayed_send` — iterate the UserOperation against the bundler, generate the witness, prove it with Groth16, lodge an approval request with `keystore_module` | `done` when the request id lands |
+| `approve` | `relayed_send_status(requestId)`, once a second, while a human decides in the Signer app | `done` on approval, `failed` on a decline (in the Signer's own words) |
+| `broadcast` | the approved operation goes to the bundler through `eth_rpc_module` | `done`, with `userOpHash` |
+
+**`broadcast` is never reported as `running`.** The poll that finds the request approved is
+the same call that fetches the signatures, applies them and submits — so this side cannot see
+the leg start, and a bar that claimed it had would be a guess. It is reported by its result.
+
+**`skipped` is not `done`.** A send on a tree already at the head walked nothing, and a route
+that said `done` would be claiming work the wallet did not do.
+
+**Why `relayed_send` and not `prepare_transfer`.** `prepare_transfer` answers with an unsigned
+`transact(…)` for the caller to sign and broadcast, and this variant has neither — the
+coordinator owns sends and has no mobile build (which is why `sendNative` refuses by name).
+`relayed_send` is the whole send inside the module, so the wallet drives it with two methods
+and a poll and every leg boundary is a reply that landed.
+
+**Four legs and not six.** `wrap` / `approve` / `shield` put funds *into* the shielded pool
+and end in public transactions this build cannot sign. This is the send of funds that are
+already shielded; the page names its own legs and invents none.
+
+- **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":…}` for a missing field
+  or a send already in flight (one at a time — `railgun_module` is `concurrency: single`).
+- **Publishes:** `privateSendJson` at every leg boundary, and `privateSyncJson` throughout the
+  sync leg.
+
+##### `QString cancelPrivateSend()`
+
+**What leaving costs depends on the leg, so the answer is on the surface and not in a
+tooltip.** #235's second clause, for the whole send rather than the sync alone.
+
+| cancelled during | what happens | what is left |
+|---|---|---|
+| `sync` | stop asking for windows; `sync_cancel` drops the pinned target | every window that completed is persisted; the note names the block reached |
+| `prove` | the flag is set and the in-flight proof is allowed to land; the request it lodges is withdrawn immediately | nothing signed, nothing broadcast |
+| `approve` | `relayed_send_cancel(requestId)` takes the request out of the Signer's queue | nothing signed, nothing broadcast |
+| `broadcast` | **refused** | the operation is the chain's and cannot be recalled |
+
+**A shield that was already mined is untouched throughout.** It is on chain and the note is
+owned by this wallet's `0zk` address, so cancelling leaves a **shielded balance and no
+transfer** — a state the wallet can show and spend from. The `note` on `privateSendJson` says
+so where the user is looking.
+
+A withdrawal that is itself refused still leaves the send `cancelled` and reports the
+refusal: the request the keystore still holds is swept on its own, so the outcome for the
+user is the same and the difference is said rather than hidden.
+
+- **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":…}` for a send that has
+  been broadcast or one that is not running.
+
 ##### Should the sync run in the background before a send? (logos-workspace#235, clause 4)
 
-**The distance is read automatically; the walk is not.** `sync_status` is one RPC, so the
-wallet always knows how far behind it is and can say so before offering a private send.
-Walking the tree is minutes of chain traffic on a phone's radio for a user who may never send
-privately, so it stays something the user asks for — and once asked for it *does* run in the
-background: the windows chain on while the rest of the wallet is used, and the walk survives
-a tab switch. The module makes resuming free (`synced_block` is persisted per window), so the
-cost of not pre-syncing is bounded by however long the user waited.
+**The distance is read automatically; the walk is started by the thing that needs it.**
+`sync_status` is one RPC, so the wallet always knows how far behind it is and can say so
+before offering a private send. Walking the tree is minutes of chain traffic on a phone's
+radio for a user who may never send privately — so it is **not** run on arrival and **not**
+left to be discovered mid-send either: `startPrivateSend` makes the walk its first leg, and a
+send on a tree already at the head skips it. A user who would rather wait now than later
+still has "Sync now" on the tab, and a walk already running is **adopted** by a send rather
+than duplicated (a second chain of windows against a `concurrency: single` module would queue
+behind the first and spend the radio twice for one tree).
+
+Once started, the walk runs in the background: the windows chain on while the rest of the
+wallet is used, and it survives a tab switch. The module makes resuming free (`synced_block`
+is persisted per window), so the cost of not pre-syncing is bounded by however long the user
+waited.
 
 ---
 
@@ -662,7 +738,7 @@ The tab index ↔ page mapping (used by the `selectTab(i)` helper) is:
 | 4 | **History** | "Recent activity"; "Refresh history" button; `historyEmpty` "No transactions yet" placeholder; per-tx rows (kind · status · hash), colored by status | `historyJson` | `refreshHistory(acct)`, plus event-driven refills via `tx_status_changed` |
 | 5 | **Settings** | proxy URL field (`placeholderText: socks5h://127.0.0.1:9050`), "Require proxy (fail-closed)" checkbox, **Apply proxy** | — | `setProxyConfig` |
 | 6 | **Advanced** | chain id / name / RPC URL / symbol / optional Multicall3 fields, **Test endpoint**, **Save chain**; "Configured networks" list; seed phrase + account label + passphrase, **Import** | `chainsJson` | `testEndpoint`, `setChains`, `importMnemonic` |
-| 7 | **Private** | "Private balance"; `privateSyncLeg` / `privateSyncState` labels, `privateSyncProgress` bar, `privateSyncProgressText` (`% · blocks to go · about N s left`), `privateSyncNote` / `privateSyncError`; **Check** / **Sync now** / **Cancel** | `privateSyncJson` | `refreshPrivateSync`, `startPrivateSync`, `cancelPrivateSync` |
+| 7 | **Private** | *the walk:* "Private balance"; `privateSyncLeg` / `privateSyncState` labels, `privateSyncProgress` bar, `privateSyncProgressText` (`% · blocks to go · about N s left`), `privateSyncNote` / `privateSyncError`; **Check** / **Sync now** / **Cancel**. *the send:* "Send privately"; `privateSendToField` / `privateSendAssetField` / `privateSendAmountField` / `privateSendMemoField` / `privateSendBundlerField`, `privateSendState`, the `privateSendLegs` route (one row per leg), `privateSendNote` / `privateSendError`; **Send privately** / **Cancel send** | `privateSyncJson`, `privateSendJson` | `refreshPrivateSync`, `startPrivateSync`, `cancelPrivateSync`, `startPrivateSend`, `cancelPrivateSend` |
 
 **Private is index 7 — appended, not placed next to Send.** The doc-tests and this table drive
 the bar by index (`call_method → selectTab(i)`), so a tab inserted in the middle renumbers

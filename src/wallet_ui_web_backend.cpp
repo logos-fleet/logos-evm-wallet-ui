@@ -48,6 +48,23 @@ const QString kStateRunning = QStringLiteral("running");
 const QString kStateDone = QStringLiteral("done");
 const QString kStateCancelled = QStringLiteral("cancelled");
 const QString kStateUnavailable = QStringLiteral("unavailable");
+// ...AND THE THREE MORE A LEG OF A SEND IS EVER IN. The same vocabulary
+// deliberately: `privateSendJson.send.state` and every entry in its `legs` are
+// read by the same QML colour function as the sync's, so a fifth spelling of
+// "this went wrong" would be a state that renders as nothing.
+// `skipped` is not `done` — a leg that was not needed and a leg that was run
+// are different claims, and only one of them is work this wallet did.
+const QString kStatePending = QStringLiteral("pending");
+const QString kStateSkipped = QStringLiteral("skipped");
+const QString kStateFailed = QStringLiteral("failed");
+
+// THE ROUTE A PRIVATE SEND TAKES, in order. Named here because the order is the
+// contract: the view renders it top to bottom and the backend walks it one leg
+// at a time.
+const QString kLegSync = QStringLiteral("sync");
+const QString kLegProve = QStringLiteral("prove");
+const QString kLegApprove = QStringLiteral("approve");
+const QString kLegBroadcast = QStringLiteral("broadcast");
 
 // How often the startup wait asks whether the page has a channel yet, and how
 // long it waits before saying it has not. A minute: a cold phone launch mounts
@@ -231,6 +248,9 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     // guess. The first `sync_status` replaces this the moment the page is
     // admitted.
     publishPrivateSync(kStateIdle, QJsonObject{}, QStringLiteral("Not checked yet."));
+    // ...and the same for the send: the route it would take, with nothing run.
+    resetSendRoute();
+    publishPrivateSend(kStateIdle, QStringLiteral("No private send has been started."));
 
     // AUTOMATIC, AND ONLY AT THE EDGES. The view already picks the first
     // account as soon as one exists (WalletView.qml's `onCountChanged`), and it
@@ -1282,7 +1302,7 @@ void WalletUiWebBackend::stepPrivateSync()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 m_syncRunning = false;
-                privateSyncUnavailable(QStringLiteral("sync_step"), res, reply);
+                syncLegEnded(false, privateSyncUnavailable(QStringLiteral("sync_step"), res, reply));
                 return;
             }
             m_syncPlan = reply;
@@ -1292,12 +1312,20 @@ void WalletUiWebBackend::stepPrivateSync()
             // the walk as left, and this is where the next one is not asked for.
             if (m_syncCancelled) {
                 m_syncRunning = false;
+                // The `sync_cancel` reply normally gets here first and has the
+                // better number to report; whichever lands first ends the leg,
+                // and `syncLegEnded` makes the second one a no-op.
+                syncLegEnded(false,
+                             cancelNote(reply.value(QStringLiteral("syncedBlock"))
+                                            .toVariant()
+                                            .toLongLong()));
                 return;
             }
             if (reply.value(QStringLiteral("done")).toBool()) {
                 m_syncRunning = false;
                 setStatusText(QStringLiteral("Private balance is up to date"));
                 publishPrivateSync(kStateDone, reply);
+                syncLegEnded(true, QString());
                 return;
             }
             // NOTHING MOVED. The module says so rather than letting a caller
@@ -1305,11 +1333,12 @@ void WalletUiWebBackend::stepPrivateSync()
             // it on the next turn either, and a spin is worse than a stall.
             if (reply.value(QStringLiteral("stalled")).toBool()) {
                 m_syncRunning = false;
-                publishPrivateSync(
-                    kStateIdle, reply,
+                const QString stalled =
                     QStringLiteral("The sync stopped making progress at block %1. "
                                    "Everything up to there is saved; try again later.")
-                        .arg(reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong()));
+                        .arg(reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong());
+                publishPrivateSync(kStateIdle, reply, stalled);
+                syncLegEnded(false, stalled);
                 return;
             }
             publishPrivateSync(kStateRunning, reply);
@@ -1331,7 +1360,8 @@ QString WalletUiWebBackend::cancelPrivateSync()
             const QJsonObject reply = replyOf(res);
             m_syncRunning = false;
             if (!callSucceeded(res, reply)) {
-                privateSyncUnavailable(QStringLiteral("sync_cancel"), res, reply);
+                syncLegEnded(false,
+                             privateSyncUnavailable(QStringLiteral("sync_cancel"), res, reply));
                 return;
             }
             m_syncPlan = reply;
@@ -1344,8 +1374,26 @@ QString WalletUiWebBackend::cancelPrivateSync()
                     : reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong();
             setStatusText(QStringLiteral("Private sync stopped"));
             publishPrivateSync(kStateCancelled, reply, cancelNote(kept));
+            syncLegEnded(false, cancelNote(kept));
         });
     return accepted();
+}
+
+// A WALK NOBODY IS WAITING ON SIMPLY HAS NO CONTINUATION, which is the ordinary
+// case: the Private tab's own "Sync now" ends when it ends. A walk a SEND
+// started is that send's first leg, and this is the hand-over.
+//
+// CLEARED BEFORE IT RUNS. Two replies can reach an end at the same moment — the
+// `sync_cancel` the user asked for and the window that was already in flight
+// when they asked — and a send carried on twice is a second `relayed_send`
+// against a `single`-concurrency module.
+void WalletUiWebBackend::syncLegEnded(bool ok, const QString& why)
+{
+    if (!m_syncThen)
+        return;
+    const std::function<void(bool, QString)> then = m_syncThen;
+    m_syncThen = nullptr;
+    then(ok, why);
 }
 
 void WalletUiWebBackend::publishPrivateSync(const QString& state, const QJsonObject& plan,
@@ -1376,9 +1424,9 @@ void WalletUiWebBackend::publishPrivateSync(const QString& state, const QJsonObj
     announce(QStringLiteral("private sync %1: %2").arg(state, jsonText(sync)));
 }
 
-void WalletUiWebBackend::privateSyncUnavailable(const QString& method,
-                                                const logos::web::ModuleCallResult& res,
-                                                const QJsonObject& reply)
+QString WalletUiWebBackend::privateSyncUnavailable(const QString& method,
+                                                   const logos::web::ModuleCallResult& res,
+                                                   const QJsonObject& reply)
 {
     const QString why = refusalReason(res, reply);
     // NAMED, ALWAYS. A build that ships no railgun_module and a railgun_module
@@ -1389,4 +1437,388 @@ void WalletUiWebBackend::privateSyncUnavailable(const QString& method,
     announce(said);
     setStatusText(said);
     publishPrivateSync(kStateUnavailable, QJsonObject{}, QString(), said);
+    return said;
+}
+
+// ── the private send ─────────────────────────────────────────────────────────
+//
+// THE SEND IS THE ISSUE; THE SYNC ABOVE IS ONE LEG OF IT. Measured end to end
+// on an iPad Air 13-inch simulator, a RAILGUN private send was ~154 s and on a
+// physical iPad Air 4 it was 239 s, of which the accumulator walk was 221 s
+// (logos-workspace#235). Nothing on screen said which part was running, nothing
+// could be stopped, and a waiter with a fixed timeout under three minutes
+// reported a failure for work that went on to succeed. This is the route made
+// visible: four legs, one call outstanding at any moment, and a cancel whose
+// meaning is stated per leg rather than implied.
+//
+// WHY `relayed_send` AND NOT `prepare_transfer`. `prepare_transfer` hands back
+// an unsigned `transact(...)` for the caller to sign and broadcast, and this
+// variant has no signing or broadcasting of its own — the coordinator owns
+// sends and has no mobile build, which is why `sendNative` here refuses by
+// name. `relayed_send` is the whole send inside the module: it builds the 7702
+// UserOperation, proves it, puts the digests in front of a human through
+// `keystore_module`, and submits the approved operation to the bundler through
+// `eth_rpc_module`. So the wallet drives a send with two methods and a poll,
+// and every leg boundary is a reply that landed rather than a guess.
+//
+// WHAT IS STILL NOT HERE, said plainly rather than faked: a SHIELD (public →
+// private). `prepare_shield` answers with public transactions for the caller to
+// approve and send, which needs exactly the signing path this variant does not
+// have — so `wrap` / `approve` / `shield`, the three legs that put funds INTO
+// the pool, belong to a build that can sign. The route below is the send of
+// funds that are already shielded, and it names its own four legs and no others.
+namespace {
+
+// HOW OFTEN A PARKED APPROVAL IS ASKED ABOUT. A human in another app is the
+// thing being waited for, so this is paced for a person and not for a chain: a
+// second is imperceptible to the user who is approving and cheap on the wire,
+// and the call itself is `approval_status` — one lookup, no chain read — until
+// the moment it is approved, when the same call does the submission.
+constexpr int kApprovalPollMs = 1000;
+
+// WHAT LEAVING COSTS, at the two legs where leaving is possible and means
+// something different. Written here, next to each other, because they are the
+// wallet's answer to #235's second clause and are meant to be read as a pair.
+const QString kCancelledBeforeSigning = QStringLiteral(
+    "Stopped before anything was signed or broadcast — the approval request was withdrawn "
+    "from the Signer app. Nothing reached the chain, and a shield that was already mined is "
+    "untouched: it stays a shielded balance you can spend.");
+
+// The one leg where there is nothing to stop.
+const QString kAlreadyBroadcast = QStringLiteral(
+    "This private send has already been broadcast: the operation is the chain's now and "
+    "cannot be recalled.");
+
+// What a send needs before this variant will spend a round trip on it, in the
+// order a user fills them in. Same rule the custom-token field follows: what
+// the wallet can see is wrong it says HERE, and never as a refusal that names a
+// module as though the module were the problem.
+QString missingSendField(const QJsonObject& p)
+{
+    if (p.value(QStringLiteral("to")).toString().trimmed().isEmpty())
+        return QStringLiteral("A private send needs a recipient (`to`) — a 0zk… address for a "
+                              "private transfer, or a 0x… address to unshield to.");
+    if (p.value(QStringLiteral("asset")).toString().trimmed().isEmpty())
+        return QStringLiteral("A private send needs the asset (`asset`) — the ERC-20 address "
+                              "held in the shielded pool.");
+    if (p.value(QStringLiteral("amount")).toString().trimmed().isEmpty())
+        return QStringLiteral("A private send needs an amount (`amount`), in the asset's own "
+                              "base units.");
+    if (p.value(QStringLiteral("owner")).toString().trimmed().isEmpty())
+        return QStringLiteral("A private send needs the account that signs it (`owner`) — the "
+                              "EOA whose signature authorises the relayed operation.");
+    if (p.value(QStringLiteral("bundlerUrl")).toString().trimmed().isEmpty())
+        return QStringLiteral("A private send needs a bundler URL (`bundlerUrl`) — the ERC-4337 "
+                              "bundler the signed operation is submitted to.");
+    return QString();
+}
+
+} // namespace
+
+void WalletUiWebBackend::resetSendRoute()
+{
+    m_sendLeg.clear();
+    m_sendLegs = QJsonArray{};
+    for (const QString& leg : { kLegSync, kLegProve, kLegApprove, kLegBroadcast })
+        m_sendLegs.append(QJsonObject{ { QStringLiteral("name"), leg },
+                                       { QStringLiteral("state"), kStatePending } });
+}
+
+void WalletUiWebBackend::setSendLeg(const QString& leg, const QString& state)
+{
+    for (int i = 0; i < m_sendLegs.size(); ++i) {
+        QJsonObject entry = m_sendLegs.at(i).toObject();
+        if (entry.value(QStringLiteral("name")).toString() != leg)
+            continue;
+        entry.insert(QStringLiteral("state"), state);
+        m_sendLegs.replace(i, entry);
+        break;
+    }
+    // `leg` names what is RUNNING, so it is only moved by a leg that starts.
+    // A leg that ends leaves it where it was, which is what lets a failed or
+    // cancelled send still say which leg it was on.
+    if (state == kStateRunning)
+        m_sendLeg = leg;
+}
+
+QString WalletUiWebBackend::sendLegState(const QString& leg) const
+{
+    for (const QJsonValue& v : m_sendLegs) {
+        const QJsonObject entry = v.toObject();
+        if (entry.value(QStringLiteral("name")).toString() == leg)
+            return entry.value(QStringLiteral("state")).toString();
+    }
+    return QString();
+}
+
+QString WalletUiWebBackend::startPrivateSend(QString sendJson)
+{
+    if (m_sendRunning)
+        return failed(QStringLiteral("A private send is already running"));
+
+    const QJsonObject params = QJsonDocument::fromJson(sendJson.toUtf8()).object();
+    const QString missing = missingSendField(params);
+    if (!missing.isEmpty()) {
+        setStatusText(missing);
+        return failed(missing);
+    }
+
+    m_sendParams = QJsonObject{
+        { QStringLiteral("to"), params.value(QStringLiteral("to")).toString().trimmed() },
+        { QStringLiteral("asset"), params.value(QStringLiteral("asset")).toString().trimmed() },
+        { QStringLiteral("amount"), params.value(QStringLiteral("amount")).toString().trimmed() },
+        { QStringLiteral("memo"), params.value(QStringLiteral("memo")).toString() },
+        { QStringLiteral("owner"), params.value(QStringLiteral("owner")).toString().trimmed() },
+        { QStringLiteral("bundlerUrl"),
+          params.value(QStringLiteral("bundlerUrl")).toString().trimmed() },
+    };
+    m_sendRequestId.clear();
+    m_sendUserOpHash.clear();
+    m_sendCancelled = false;
+    m_sendRunning = true;
+    resetSendRoute();
+
+    // LEG 1 — THE WALK, AND WHO STARTS IT. #235's fourth clause asks whether
+    // the sync should run in the background before a send. The split this
+    // wallet makes: the DISTANCE is read automatically because it is one
+    // `eth_blockNumber` and is what lets the tab warn before a send is offered;
+    // the WALK is minutes of a phone's radio, so it happens when something
+    // needs the tree — and the thing that needs the tree is a send.
+    if (m_syncPlan.value(QStringLiteral("done")).toBool()) {
+        // LEVEL ALREADY, and the wallet knows it without asking because the
+        // distance is read automatically. `skipped`, not `done`: this send
+        // walked nothing, and a route that claimed otherwise would be claiming
+        // work. No continuation is set here at all — there is no walk to wait
+        // on, and one left behind would carry a finished send onward the next
+        // time the user pressed "Sync now".
+        setSendLeg(kLegSync, kStateSkipped);
+        beginSendProve();
+        return accepted();
+    }
+
+    setSendLeg(kLegSync, kStateRunning);
+    m_syncThen = [this](bool ok, const QString& why) {
+        if (!ok) {
+            const bool left = m_sendCancelled;
+            setSendLeg(kLegSync, left ? kStateCancelled : kStateFailed);
+            finishSend(left ? kStateCancelled : kStateFailed, left ? why : QString(),
+                       left ? QString() : why);
+            return;
+        }
+        setSendLeg(kLegSync, kStateDone);
+        beginSendProve();
+    };
+    publishPrivateSend(kStateRunning);
+
+    if (m_syncRunning) {
+        // A WALK IS ALREADY RUNNING — the user asked for it on the tab, or an
+        // earlier ask has not finished. It is ADOPTED rather than duplicated:
+        // `railgun_module` is `concurrency: single`, so a second chain of
+        // windows against the same plan would queue behind the first and spend
+        // the radio twice for one tree. The continuation above is all this send
+        // needs; the walk that is running will run it.
+        announce(QStringLiteral("private send: taking the walk already running as its sync leg"));
+        return accepted();
+    }
+    startPrivateSync();
+    return accepted();
+}
+
+// LEG 2 — the proof. `relayed_send` is one call that does several minutes'
+// worth of nothing visible: it iterates a UserOperation against the bundler,
+// generates the witness, proves it with Groth16 and lodges the approval
+// request. There is no window inside it to report, which is exactly why the leg
+// is NAMED — "prove, running" is the difference between a wallet that is
+// working and a wallet that has hung.
+void WalletUiWebBackend::beginSendProve()
+{
+    setSendLeg(kLegProve, kStateRunning);
+    setStatusText(QStringLiteral("Proving the private send…"));
+    publishPrivateSend(kStateRunning);
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("relayed_send"), QJsonArray{ jsonText(m_sendParams) },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                const QString why = QStringLiteral("%1 refused relayed_send: %2")
+                                        .arg(kRailgun, refusalReason(res, reply));
+                announce(why);
+                setStatusText(why);
+                setSendLeg(kLegProve, kStateFailed);
+                finishSend(kStateFailed, QString(), why);
+                return;
+            }
+            m_sendRequestId = reply.value(QStringLiteral("requestId")).toString();
+            setSendLeg(kLegProve, kStateDone);
+            // THE USER LEFT WHILE IT WAS PROVING. There was no request to
+            // withdraw until this reply landed, and now there is one — so the
+            // cancel that could not be served then is served here.
+            if (m_sendCancelled) {
+                withdrawSendRequest();
+                return;
+            }
+            setSendLeg(kLegApprove, kStateRunning);
+            setStatusText(QStringLiteral("Waiting for approval in the Signer app"));
+            publishPrivateSend(kStateRunning);
+            pollSendApproval();
+        });
+}
+
+// LEG 3 — the human, and LEG 4 inside its last reply. `relayed_send_status`
+// answers `awaiting_approval` while the request is unanswered; the call that
+// finds it approved is the one that fetches the signatures, puts them into the
+// operation and submits it to the bundler. So `broadcast` is reported by its
+// result and never as `running`: this side cannot see it start, and a leg shown
+// as running for work that may not have begun is the lie this whole surface
+// exists to avoid.
+void WalletUiWebBackend::pollSendApproval()
+{
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("relayed_send_status"), QJsonArray{ m_sendRequestId },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                const QString why = QStringLiteral("%1 refused relayed_send_status: %2")
+                                        .arg(kRailgun, refusalReason(res, reply));
+                announce(why);
+                setStatusText(why);
+                setSendLeg(kLegApprove, kStateFailed);
+                finishSend(kStateFailed, QString(), why);
+                return;
+            }
+            const QString state = reply.value(QStringLiteral("state")).toString();
+            if (state == QStringLiteral("done")) {
+                m_sendUserOpHash = reply.value(QStringLiteral("userOpHash")).toString();
+                setSendLeg(kLegApprove, kStateDone);
+                setSendLeg(kLegBroadcast, kStateDone);
+                setStatusText(QStringLiteral("Private send submitted"));
+                finishSend(kStateDone,
+                           QStringLiteral("Submitted to the bundler as %1.").arg(m_sendUserOpHash));
+                return;
+            }
+            if (state == QStringLiteral("declined")) {
+                // NOT A FAILURE OF THE WALLET, and named as what it is: a
+                // person, or the keystore's sweep, said no. Nothing was
+                // broadcast and nothing was spent.
+                const QString reason = reply.value(QStringLiteral("reason")).toString();
+                setSendLeg(kLegApprove, kStateFailed);
+                const QString why =
+                    QStringLiteral("The Signer app did not approve this send: %1")
+                        .arg(reason.isEmpty() ? QStringLiteral("declined") : reason);
+                setStatusText(why);
+                finishSend(kStateFailed, QString(), why);
+                return;
+            }
+            if (state != QStringLiteral("awaiting_approval")) {
+                const QString why =
+                    QStringLiteral("%1 answered an approval state this wallet does not know: %2")
+                        .arg(kRailgun, state);
+                announce(why);
+                setSendLeg(kLegApprove, kStateFailed);
+                finishSend(kStateFailed, QString(), why);
+                return;
+            }
+            if (m_sendCancelled) {
+                withdrawSendRequest();
+                return;
+            }
+            // ASKED AGAIN, ON A TIMER, and the timer is the only place in this
+            // route where a call is not chained out of a reply — because what
+            // is being waited for is a person, and there is no reply to chain
+            // out of until they answer.
+            QTimer::singleShot(kApprovalPollMs, this, [this]() {
+                if (m_sendRunning && !m_sendCancelled)
+                    pollSendApproval();
+            });
+        });
+}
+
+void WalletUiWebBackend::withdrawSendRequest()
+{
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("relayed_send_cancel"), QJsonArray{ m_sendRequestId },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            setSendLeg(kLegApprove, kStateCancelled);
+            if (!callSucceeded(res, reply)) {
+                // THE SEND IS STILL CANCELLED. A withdrawal that did not land
+                // leaves a request in the approver's queue, which the keystore
+                // sweeps on its own — so the outcome for the user is the same
+                // and the difference is said rather than hidden.
+                const QString why = QStringLiteral("%1 refused relayed_send_cancel: %2")
+                                        .arg(kRailgun, refusalReason(res, reply));
+                announce(why);
+                finishSend(kStateCancelled, kCancelledBeforeSigning, why);
+                return;
+            }
+            setStatusText(QStringLiteral("Private send cancelled"));
+            finishSend(kStateCancelled, kCancelledBeforeSigning);
+        });
+}
+
+// LEAVING, AND WHAT IT COSTS AT THE LEG THE SEND IS ON. The route keeps exactly
+// one call outstanding, so there is always exactly one thing to not do next —
+// and the note that lands says what was and was not done, on the surface the
+// user is looking at.
+QString WalletUiWebBackend::cancelPrivateSend()
+{
+    // Checked before "is anything running", because a finished send is not
+    // running and the honest answer to cancelling one is not "there is nothing
+    // here" — it is that the operation has left.
+    if (sendLegState(kLegBroadcast) == kStateDone)
+        return failed(kAlreadyBroadcast);
+    if (!m_sendRunning)
+        return failed(QStringLiteral("No private send is running"));
+
+    m_sendCancelled = true;
+    if (m_sendLeg == kLegSync) {
+        // The walk's own cancel, which is not an undo and does not need to be:
+        // every window it finished is persisted. `syncLegEnded` then ends the
+        // send with the block the walk kept.
+        cancelPrivateSync();
+        return accepted();
+    }
+    if (!m_sendRequestId.isEmpty()) {
+        withdrawSendRequest();
+        return accepted();
+    }
+    // The proof is in flight and has not lodged a request yet. There is nothing
+    // to withdraw and nothing to roll back; the reply will find the flag and
+    // withdraw whatever it created.
+    setStatusText(QStringLiteral("Stopping the private send…"));
+    publishPrivateSend(kStateRunning, QStringLiteral("Stopping once the proof answers…"));
+    return accepted();
+}
+
+void WalletUiWebBackend::publishPrivateSend(const QString& state, const QString& note,
+                                            const QString& error)
+{
+    QJsonObject send;
+    send.insert(QStringLiteral("state"), state);
+    send.insert(QStringLiteral("leg"), m_sendLeg);
+    send.insert(QStringLiteral("legs"), m_sendLegs);
+    // WHETHER THE BUTTON SHOULD BE THERE, decided here rather than by a view
+    // reading five states and guessing. A broadcast send is the one that is
+    // over and cannot be taken back.
+    send.insert(QStringLiteral("cancellable"), m_sendRunning);
+    if (!m_sendRequestId.isEmpty())
+        send.insert(QStringLiteral("requestId"), m_sendRequestId);
+    if (!m_sendUserOpHash.isEmpty())
+        send.insert(QStringLiteral("userOpHash"), m_sendUserOpHash);
+    if (!note.isEmpty())
+        send.insert(QStringLiteral("note"), note);
+    if (!error.isEmpty())
+        send.insert(QStringLiteral("error"), error);
+
+    QJsonObject out;
+    out.insert(QStringLiteral("send"), send);
+    setPrivateSendJson(jsonText(out));
+    announce(QStringLiteral("private send %1: %2").arg(state, jsonText(send)));
+}
+
+void WalletUiWebBackend::finishSend(const QString& state, const QString& note,
+                                    const QString& error)
+{
+    m_sendRunning = false;
+    publishPrivateSend(state, note, error);
 }
