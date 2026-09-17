@@ -137,6 +137,75 @@ QString phraseJson()
                                  .toJson(QJsonDocument::Compact));
 }
 
+// ── the role document names an approver this image actually carries ──────────
+//
+// logos-workspace#245. `configure` is TOTAL: a role this document does not name
+// is held by NOBODY. The document named `evm_signer_ui` alone — a desktop
+// `ui_qml` module that has never been in this workspace and certainly does not
+// run on a phone — so on a device the approver role was held by a module that
+// could not answer, and every `request_approval` parked at `sign` for ever.
+// That is the whole of why the shield's `wrap` / `approve` / `shield` legs had
+// never reached a chain.
+//
+// `evm_signer_cli` is the headless approver: the same role, driven by method
+// calls instead of a window, and Bundled beside this wallet on a phone. ADDED
+// to the set, not put in place of the UI — a role is a set precisely so a
+// second holder can be added, and a desktop image still has its Signer app.
+void theApproverSetNamesAnApproverThisImageCarries()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.importMnemonic(phraseJson(), QStringLiteral("main"));
+
+    if (!expectCall(0, QStringLiteral("keystore_module"), QStringLiteral("caller_identity")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "kind", "module" }, { "identity", "wallet_ui" } });
+
+    const std::optional<fake_door::Call> configured =
+        expectCall(1, QStringLiteral("keystore_module"), QStringLiteral("configure"));
+    if (!configured)
+        return;
+
+    const QJsonObject roles = parse(configured->args.isEmpty()
+                                        ? QString()
+                                        : configured->args.at(0).toString());
+
+    // A role may be one name or a list of them; read both shapes as a set, so
+    // this asserts membership rather than a spelling.
+    const auto holdersOf = [&roles](const QString& role) {
+        QStringList out;
+        const QJsonValue v = roles.value(role);
+        if (v.isString())
+            out << v.toString();
+        for (const QJsonValue& e : v.toArray())
+            out << e.toString();
+        return out;
+    };
+
+    const QStringList approvers = holdersOf(QStringLiteral("approvers"));
+    check(approvers.contains(QStringLiteral("evm_signer_cli")),
+          QStringLiteral("the approver role does not name the headless signer, so nothing on a "
+                         "phone can answer request_approval: %1")
+              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+    check(approvers.contains(QStringLiteral("evm_signer_ui")),
+          QStringLiteral("naming the headless signer revoked the Signer app's approval — "
+                         "configure is TOTAL: %1")
+              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+
+    // ...and the custodians are untouched by the same argument.
+    const QStringList custodians = holdersOf(QStringLiteral("custodians"));
+    check(custodians.contains(QStringLiteral("evm_keystore_ui"))
+              && custodians.contains(QStringLiteral("wallet_ui")),
+          QStringLiteral("the custodian set lost a holder: %1")
+              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+
+    if (failures == before)
+        pass("the role document names an approver this image carries, without revoking the one "
+             "a desktop has");
+}
+
 // ── the import reaches the keystore ──────────────────────────────────────────
 void importGoesToTheKeystore()
 {
@@ -1882,6 +1951,7 @@ int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
 
+    theApproverSetNamesAnApproverThisImageCarries();
     importGoesToTheKeystore();
     aKeystoreRefusalIsReportedInItsOwnWords();
     withoutALabelNothingIsLabelled();

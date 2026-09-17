@@ -163,10 +163,30 @@ QString jsonText(const QJsonArray& arr)
 // all this adds. The desktop variant sends the same document; the two are
 // separate images with no shared translation unit, so they must stay in step by
 // hand.
+//
+// AND WHY THE APPROVER SET HAS TWO NAMES (logos-workspace#245). The same
+// argument, one role along. `keystore_module` signs nothing without a human:
+// this wallet asks through `request_approval`, and only a configured APPROVER
+// may claim the request, read the keystore's own render lines and answer
+// `approve(handle, bundle_id, password)`. The built-in approver is
+// `evm_signer_ui` — the desktop Signer app, which is not in this workspace and
+// does not run on a phone — so on a device the role was held by a module that
+// could never answer, and every approval this wallet asked for parked at `sign`
+// for ever. That is the whole of why the shield's `wrap` / `approve` / `shield`
+// legs had never reached a chain.
+//
+// `evm_signer_cli` is the headless approver: the same role and the same gate —
+// it re-claims the request, checks the bundle id against the one on screen and
+// takes the vault password — driven by method calls rather than a window. It is
+// a Bundled member of the mobile app image beside this wallet. Naming it here
+// does not admit it: the keystore admits a CONFIGURED approver, and this is the
+// document that configures one.
 QString custodianRoles()
 {
     QJsonObject roles;
-    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("approvers"),
+                 QJsonArray{ QStringLiteral("evm_signer_ui"),
+                             QStringLiteral("evm_signer_cli") });
     roles.insert(QStringLiteral("custodians"),
                  QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
     return jsonText(roles);

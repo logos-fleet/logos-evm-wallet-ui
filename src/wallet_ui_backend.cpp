@@ -42,10 +42,18 @@ bool replyOk(const QString& replyJson)
 // all this adds. The `web` variant sends the same document; the two are
 // separate images with no shared translation unit, so they must stay in step by
 // hand.
+//
+// AND WHY THE APPROVER SET HAS TWO NAMES (logos-workspace#245). The built-in
+// approver `evm_signer_ui` is the desktop Signer app; `evm_signer_cli` is the
+// headless one, which holds the same role under the same gate and answers over
+// method calls instead of a window. A desktop that has the Signer app keeps it
+// — this is an addition — and an image that has only the CLI can still approve.
 QString custodianRoles()
 {
     QJsonObject roles;
-    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("approvers"),
+                 QJsonArray{ QStringLiteral("evm_signer_ui"),
+                             QStringLiteral("evm_signer_cli") });
     roles.insert(QStringLiteral("custodians"),
                  QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
     return jsonText(roles);
