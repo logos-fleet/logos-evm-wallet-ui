@@ -63,17 +63,35 @@
           # Every check in this tree reads metadata.json and therefore agrees
           # with itself. This one reads the BUILT package.
           #
-          # Absent, not skipped, when this builder pin publishes no `web` output
-          # or predates the check: there is no artifact to compare, and a stub
-          # here would be a second green line meaning nothing.
-          webManifestCheck = nixpkgs.lib.optionalAttrs
-            ((module.packages.${system} or { }) ? web
-             && logos-module-builder.lib ? checkWebManifest) {
+          # A SKIP THAT SAYS SO, exactly as `web-backend` below does and for the
+          # same pin: this repo's OWN flake.lock still points at a
+          # logos-module-builder without `lib.checkWebManifest`, so from the
+          # sub-repo flake there is no comparison to run. Omitting the attribute
+          # was the first shape of this, and it is what a silent hole looks
+          # like -- `ws test logos-evm-wallet-ui` reported a green run in which
+          # nothing compared the manifest at all. A line naming the pin is what
+          # tells a reader the difference between "checked" and "not checked
+          # here".
+          webManifestCheck =
+            if (module.packages.${system} or { }) ? web
+               && logos-module-builder.lib ? checkWebManifest
+            then {
               web-manifest = logos-module-builder.lib.checkWebManifest pkgs {
                 name = "wallet_ui";
                 webPackage = module.packages.${system}.web;
                 metadataFile = ./metadata.json;
               };
+            }
+            else {
+              web-manifest = pkgs.runCommand "wallet-ui-web-manifest-check-skipped" { } ''
+                echo "SKIP: web-manifest -- this logos-module-builder pin has no"
+                echo "      lib.checkWebManifest, or publishes no \`web\` variant for"
+                echo "      this module, so there is no shipped manifest to compare."
+                echo "      Run through the workspace flake:"
+                echo "      ws test logos-evm-wallet-ui --local logos-module-builder"
+                mkdir -p $out
+                echo skipped > $out/result
+              '';
             };
         in
         (module.checks.${system} or { }) // {
