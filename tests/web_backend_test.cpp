@@ -512,6 +512,264 @@ void aTokenWithNoAddressIsRefusedWithoutAsking()
         pass("a token with no address is refused here, without a round trip");
 }
 
+
+// ── the sync a private send waits on, in windows the view can see ────────────
+//
+// logos-workspace#235: a private send is ~154 s on a phone and ~92 % of it is
+// the accumulator sync, which `railgun_module.sync()` does in ONE call that
+// reports nothing and cannot be interrupted. `sync_step` is the same work in
+// bounded windows; what is asserted here is that this variant WALKS them —
+// asks for the next one only when the last has answered, publishes the
+// progress in between, and stops the moment the plan is done.
+QJsonObject planReply(int percent, int syncedBlock, bool done)
+{
+    return QJsonObject{ { "ok", true },
+                        { "done", done },
+                        { "percent", percent },
+                        { "startBlock", 11720000 },
+                        { "syncedBlock", syncedBlock },
+                        { "targetBlock", 11721000 },
+                        { "blocksTotal", 1000 },
+                        { "blocksDone", syncedBlock - 11720000 },
+                        { "blocksRemaining", 11721000 - syncedBlock },
+                        { "windows", 1 },
+                        { "elapsedMs", 5000 },
+                        { "etaMs", done ? QJsonValue() : QJsonValue(6000) } };
+}
+
+QJsonObject privateSync(const WalletUiWebBackend& backend)
+{
+    return parse(backend.privateSyncJson()).value(QStringLiteral("sync")).toObject();
+}
+
+void theSyncIsWalkedInWindowsAndTheViewSeesEachOne()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const QJsonObject taken = parse(backend.startPrivateSync());
+    check(taken.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("startPrivateSync did not take the ask: %1")
+              .arg(QString::fromUtf8(QJsonDocument(taken).toJson(QJsonDocument::Compact))));
+
+    // ONE WINDOW IS ASKED FOR, and the budget is in the ask: a window that ran
+    // for the module's own default (20 s) would repaint the view three times a
+    // minute, which is the spinner this issue exists to remove.
+    const std::optional<fake_door::Call> first =
+        expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_step"));
+    if (!first)
+        return;
+    // A STRING, not an object: `sync_step(params_json: String)` refuses an
+    // object by name, which cost a device run to find (logos-workspace#235).
+    check(first->args.size() == 1 && first->args.at(0).isString(),
+          QStringLiteral("sync_step was not given its params as one JSON string: %1")
+              .arg(describe(*first)));
+    const QJsonObject params = parse(first->args.isEmpty() ? QString()
+                                                           : first->args.at(0).toString());
+    check(params.value(QStringLiteral("budgetMs")).toInt(0) > 0
+              && params.value(QStringLiteral("budgetMs")).toInt(0) <= 10000,
+          QStringLiteral("a window's budget is not sized for a view: %1").arg(describe(*first)));
+
+    fake_door::answerJson(0, planReply(40, 11720400, false));
+
+    const QJsonObject running = privateSync(backend);
+    check(running.value(QStringLiteral("state")).toString() == QStringLiteral("running"),
+          QStringLiteral("the surface is not running after a window: %1")
+              .arg(backend.privateSyncJson()));
+    check(running.value(QStringLiteral("percent")).toInt(-1) == 40,
+          QStringLiteral("the percentage did not reach the view: %1").arg(backend.privateSyncJson()));
+    check(running.value(QStringLiteral("blocksRemaining")).toInt(-1) == 600,
+          QStringLiteral("the blocks left did not reach the view: %1").arg(backend.privateSyncJson()));
+    check(running.value(QStringLiteral("etaMs")).toInt(-1) == 6000,
+          QStringLiteral("the ETA did not reach the view: %1").arg(backend.privateSyncJson()));
+    check(running.value(QStringLiteral("leg")).toString() == QStringLiteral("sync"),
+          QStringLiteral("the running leg is not named: %1").arg(backend.privateSyncJson()));
+
+    // ...and the NEXT window is asked for only now, from inside the reply.
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+    fake_door::answerJson(1, planReply(100, 11721000, true));
+
+    const QJsonObject finished = privateSync(backend);
+    check(finished.value(QStringLiteral("state")).toString() == QStringLiteral("done"),
+          QStringLiteral("a finished plan is not reported done: %1").arg(backend.privateSyncJson()));
+    check(fake_door::calls.size() == 2,
+          QStringLiteral("a finished plan was stepped again: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("the accumulator sync is walked one window at a time, and each one reaches the view");
+}
+
+// ── leaving is: stop asking for windows ──────────────────────────────────────
+//
+// #235's second clause. 154 s is long enough that a user will try to leave, and
+// leaving must not corrupt anything. It cannot, and this asserts the mechanism
+// that makes that true rather than the claim: the walk is one window at a time,
+// so a cancel is "do not ask for the next one" — and the window already in
+// flight is allowed to land, because a sync only reads the chain and every
+// window it completes is persisted before it returns.
+void cancellingStopsAskingAndSaysWhatItLeft()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.startPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+    fake_door::answerJson(0, planReply(40, 11720400, false));
+    // The reply chained the next window, which is now in flight.
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+
+    backend.cancelPrivateSync();
+    const std::optional<fake_door::Call> cancelled =
+        expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("sync_cancel"));
+    if (!cancelled)
+        return;
+
+    // The in-flight window lands AFTER the user has left. It must not chain a
+    // third one — that is the whole of the cancel.
+    fake_door::answerJson(1, planReply(70, 11720700, false));
+    check(fake_door::calls.size() == 3,
+          QStringLiteral("a window was asked for after the cancel: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    QJsonObject reply = planReply(70, 11720700, false);
+    reply.insert(QStringLiteral("cancelled"), true);
+    reply.insert(QStringLiteral("keptToBlock"), 11720700);
+    fake_door::answerJson(2, reply);
+
+    const QJsonObject state = privateSync(backend);
+    check(state.value(QStringLiteral("state")).toString() == QStringLiteral("cancelled"),
+          QStringLiteral("the surface does not report the cancel: %1").arg(backend.privateSyncJson()));
+    // THE POST-CANCEL STATE, SHOWN. #235 asks the wallet to decide and document
+    // what a cancel does to a shield that is already mined; the answer — nothing
+    // — is on the surface the user is looking at, not only in a rustdoc.
+    const QString note = state.value(QStringLiteral("note")).toString();
+    check(note.contains(QStringLiteral("11720700")),
+          QStringLiteral("the block the walk reached is not shown: %1").arg(note));
+    check(note.contains(QStringLiteral("shield")) && note.contains(QStringLiteral("untouched")),
+          QStringLiteral("the note does not say what a mined shield does: %1").arg(note));
+
+    if (failures == before)
+        pass("a cancel stops asking for windows, and the view is told what it left");
+}
+
+// ── a build with no railgun says so, by name ─────────────────────────────────
+//
+// This variant does NOT declare railgun_module a dependency: an image carries it
+// only when it was bundled, and declaring it would stop the wallet loading at
+// all on every build that did not. The price of that choice is that the refusal
+// has to be worth reading, so it is asserted here — the module is named, its own
+// words are kept, and the surface says `unavailable` rather than showing a
+// convincing 0 %.
+void aPrivateSyncWithNoRailgunIsNamedNotBlank()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::failCall(0, QStringLiteral("module not found: railgun_module"));
+
+    const QJsonObject state = privateSync(backend);
+    check(state.value(QStringLiteral("state")).toString() == QStringLiteral("unavailable"),
+          QStringLiteral("a missing railgun did not read as unavailable: %1")
+              .arg(backend.privateSyncJson()));
+    check(state.value(QStringLiteral("error")).toString().contains(QStringLiteral("railgun_module")),
+          QStringLiteral("the refusal does not name the module: %1").arg(backend.privateSyncJson()));
+    check(backend.statusText().contains(QStringLiteral("railgun_module")),
+          QStringLiteral("the status line does not name the module: %1").arg(backend.statusText()));
+    check(!state.contains(QStringLiteral("percent")),
+          QStringLiteral("an unavailable sync still shows a percentage: %1")
+              .arg(backend.privateSyncJson()));
+
+    if (failures == before)
+        pass("a build with no railgun_module is named on the private surface, not blank");
+}
+
+// ── an uninitialised engine keeps its own words ──────────────────────────────
+void aModuleRefusalIsReportedInItsOwnWords()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", false },
+                                          { "error", "railgun_module not initialized (call init first)" } });
+
+    check(privateSync(backend).value(QStringLiteral("error")).toString().contains(
+              QStringLiteral("not initialized")),
+          QStringLiteral("the module's own reason was dropped: %1").arg(backend.privateSyncJson()));
+
+    if (failures == before)
+        pass("an uninitialised engine is reported in railgun_module's own words");
+}
+
+// ── one walk at a time ───────────────────────────────────────────────────────
+//
+// `railgun_module` is `concurrency: single`, so a second chain of windows would
+// queue behind the first and spend the radio twice for one plan — and the view
+// would see the percentage flip between two readings of it.
+void aSecondStartDoesNotDoubleTheWalk()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.startPrivateSync();
+    const QJsonObject second = parse(backend.startPrivateSync());
+    check(!second.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a second start was accepted: %1")
+              .arg(QString::fromUtf8(QJsonDocument(second).toJson(QJsonDocument::Compact))));
+    check(fake_door::calls.size() == 1,
+          QStringLiteral("a second start asked for another window: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a second start is refused rather than walking the same plan twice");
+}
+
+// ── a sync that stops moving is not looped on ────────────────────────────────
+void aStalledSyncStopsAskingAndSaysWhereItGotTo()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.startPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+    QJsonObject stalled = planReply(40, 11720400, false);
+    stalled.insert(QStringLiteral("stalled"), true);
+    fake_door::answerJson(0, stalled);
+
+    check(fake_door::calls.size() == 1,
+          QStringLiteral("a stalled sync was stepped again: %1 calls")
+              .arg(fake_door::calls.size()));
+    const QJsonObject state = privateSync(backend);
+    check(state.value(QStringLiteral("state")).toString() == QStringLiteral("idle"),
+          QStringLiteral("a stalled sync still reads as running: %1").arg(backend.privateSyncJson()));
+    check(state.value(QStringLiteral("note")).toString().contains(QStringLiteral("11720400")),
+          QStringLiteral("a stalled sync does not say where it got to: %1")
+              .arg(backend.privateSyncJson()));
+
+    // ...and it can be started again: the module plans afresh from where it is.
+    check(parse(backend.startPrivateSync()).value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a stalled sync cannot be retried"));
+
+    if (failures == before)
+        pass("a sync that stops making progress is reported, not looped on");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -529,6 +787,12 @@ int main(int argc, char** argv)
     aCustomTokenGoesToTheModuleAndTheListIsReread();
     aTokenTheModuleRefusesIsNotReportedAsAdded();
     aTokenWithNoAddressIsRefusedWithoutAsking();
+    theSyncIsWalkedInWindowsAndTheViewSeesEachOne();
+    cancellingStopsAskingAndSaysWhatItLeft();
+    aPrivateSyncWithNoRailgunIsNamedNotBlank();
+    aModuleRefusalIsReportedInItsOwnWords();
+    aSecondStartDoesNotDoubleTheWalk();
+    aStalledSyncStopsAskingAndSaysWhereItGotTo();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

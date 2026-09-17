@@ -95,6 +95,11 @@ public slots:
     // History
     void refreshHistory(QString address) override;
 
+    // Private (RAILGUN) — the accumulator sync a private send waits on.
+    void refreshPrivateSync() override;
+    QString startPrivateSync() override;
+    QString cancelPrivateSync() override;
+
 private:
     // THE VARIANT STARTS ITSELF. There is no onContextReady in a wasm image:
     // the host constructs this object in main() and the page's bridge is not
@@ -153,6 +158,41 @@ private:
     // NATIVE module's, so this only avoids re-sending — it is a cache, never a
     // source of truth, and a chain eth_rpc refused drops back out of it.
     QSet<int> m_chainsConfigured;
+
+    // ── the private sync, walked ─────────────────────────────────────────────
+    //
+    // A SYNC IS A WALK, NOT A CALL. `railgun_module.sync()` is one call that
+    // took 221 s on a physical iPad Air 4 with nothing to report and nothing to
+    // interrupt (logos-workspace#235); `sync_step` is the same work in windows.
+    // So the state a walk needs lives here: whether one is in flight, whether
+    // the user has left, and what the last window said.
+    //
+    // THE NEXT WINDOW IS ASKED FOR FROM INSIDE THE LAST ONE'S REPLY, which is
+    // the same rule every chained call in this file follows and here it is also
+    // what makes a cancel possible: there is never more than one window in
+    // flight, so "stop" is "do not ask again".
+    bool m_syncRunning = false;
+    bool m_syncCancelled = false;
+    // The last plan `railgun_module` answered with, kept so a cancel can report
+    // the block the walk reached without asking for it a second time.
+    QJsonObject m_syncPlan;
+
+    void stepPrivateSync();
+    // Publish `privateSyncJson`. `state` is the verdict this variant puts on
+    // the module's plan (idle / running / done / cancelled / unavailable);
+    // `plan` is the module's own fields, passed through unchanged so the view
+    // reads the numbers the engine produced rather than a second copy of them.
+    void publishPrivateSync(const QString& state, const QJsonObject& plan,
+                            const QString& note = QString(),
+                            const QString& error = QString());
+    // What a refused `railgun_module` call publishes: `unavailable`, with the
+    // module's own words or the door's. A build that ships no railgun_module at
+    // all lands here too, which is the honest answer for it — this variant
+    // does not declare railgun a dependency (see the .cpp) precisely so that
+    // build still loads.
+    void privateSyncUnavailable(const QString& method,
+                                const logos::web::ModuleCallResult& res,
+                                const QJsonObject& reply);
 
     QJsonObject chainById(int chainId) const;
     void seedDefaultChains();

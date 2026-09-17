@@ -255,6 +255,7 @@ auto-synced to the QML replica, where the view reads them as `backend.<prop>`.
 | `historyJson` | `QString` | READONLY | JSON `{"ok":true,"history":[…]}` local tx records. | `get_history()` |
 | `marketJson` | `QString` | READONLY | JSON `{"ok":true,"address","chains":[{chainId,items:[…]}]}` Uniswap-priced holdings. | `get_market()` |
 | `proxyStatus` | `QString` | READONLY | `"Proxy applied"` / `"Proxy failed"` after a proxy apply. Initial `""`. | `setProxyConfig` |
+| `privateSyncJson` | `QString` | READONLY | JSON `{"sync":{leg,state,percent,blocksRemaining,etaMs,…}}` — the RAILGUN accumulator sync a private send waits on. `state` is `idle` / `running` / `done` / `cancelled` / `unavailable`; the module's own plan fields are passed through unchanged. | `railgun_module.sync_status` / `sync_step` / `sync_cancel` (`web` variant only) |
 
 ### Slots (UI-callable methods)
 
@@ -526,6 +527,84 @@ Loads the locally-recorded, wallet-originated transactions for an account.
 
 ---
 
+#### Private (RAILGUN)
+
+The three slots behind the Private tab. **Only the `web` variant serves them**; the desktop
+plugin refuses by name (see "Why the desktop half refuses" below).
+
+##### `void refreshPrivateSync()`
+
+How far behind the private (shielded) balance is, **without walking anything**.
+
+- **Backend call:** `railgun_module.sync_status()`.
+- **Cost:** one `eth_blockNumber`. No chain walk, no subsquid query — which is what makes it
+  safe to ask before a send is offered rather than after.
+- **Publishes:** `privateSyncJson` with `state` `idle` / `running` / `done`, or `unavailable`
+  with the reason in `error`.
+
+##### `QString startPrivateSync()`
+
+Walk the accumulator to the pinned target, **one bounded window at a time**.
+
+- **Backend call:** `railgun_module.sync_step("{\"blocks\":25000,\"budgetMs\":5000}")`, repeated
+  — the next window is asked for from inside the previous one's reply, so exactly one is ever
+  in flight. The params are a JSON **string**, not an object: `sync_step(params_json: String)`
+  refuses an object by name.
+- **Budget:** 5 000 ms per window rather than the module's own 20 000 ms default, so the bar
+  moves about twelve times a minute instead of three.
+- **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":"A private sync is already
+  running"}` — one walk at a time, because `railgun_module` is `concurrency: single` and a
+  second chain would queue behind the first and spend the radio twice for one plan.
+- **Publishes:** `privateSyncJson` after every window, and once more on `done` / `stalled`.
+
+##### `QString cancelPrivateSync()`
+
+Stop asking for windows.
+
+- **Backend call:** `railgun_module.sync_cancel()`, which drops the pinned target so the next
+  step plans against a fresh head.
+- **IT IS NOT AN UNDO, and there is nothing to undo.** A sync only reads the chain, and
+  `UtxoIndexer::sync_to` persists `synced_block` before each window returns — so every window
+  that completed is on disk and a later step, or a later launch, resumes from there.
+- **A shield that is already mined is untouched.** It is on chain, the note is owned by this
+  wallet's `0zk` address, and the next sync of any length finds and decrypts it. Cancelling
+  after a shield leaves a **shielded balance and no transfer** — a state the wallet can show
+  and spend from. The post-cancel `privateSyncJson.sync.note` says exactly this, so the
+  guarantee is on the surface the user is looking at and not only in a rustdoc.
+- **Returns:** `{"ok":true,"pending":true}`.
+
+##### Why the desktop half refuses
+
+`railgun_module` is a Bundled member of a **mobile** image, and the wallet's `web` variant is
+the half that runs there (`logos-basecamp` ships it as `LOGOS_SHELL_WEB_MODULES=wallet_ui`).
+The desktop plugin talks to `wallet_backend_module`, and the coordinator does not name railgun
+in its dependencies — so there is no private send behind a desktop build and nothing to report
+progress for. It answers `state: "unavailable"` with the module named, in the same shape, so
+the same QML renders both halves.
+
+##### Why `railgun_module` is NOT in `web.dependencies`
+
+The core resolves a module's declared dependencies before loading it and **refuses a module
+whose list it cannot satisfy**. `railgun_module` is carried only by an image that asked for it
+(`--bundle railgun_module`), so declaring it would mean every build without it could no longer
+load the wallet at all — trading every wallet build for a tab. The private surface is
+**discovered** instead: the wallet asks, and a build that does not carry railgun answers a
+refusal published as `unavailable` with the reason in it. Same shape as the catalog's derived
+floor for `token_list_module` (ADR 0009) — a control a user can see refusing, rather than a
+module that silently will not start.
+
+##### Should the sync run in the background before a send? (logos-workspace#235, clause 4)
+
+**The distance is read automatically; the walk is not.** `sync_status` is one RPC, so the
+wallet always knows how far behind it is and can say so before offering a private send.
+Walking the tree is minutes of chain traffic on a phone's radio for a user who may never send
+privately, so it stays something the user asks for — and once asked for it *does* run in the
+background: the windows chain on while the rest of the wallet is used, and the walk survives
+a tab switch. The module makes resuming free (`synced_block` is persisted per window), so the
+cost of not pre-syncing is bounded by however long the user waited.
+
+---
+
 ## The QML view (`qml/WalletView.qml`) and the tab structure
 
 The root is an `Item { objectName: "walletRoot"; width: 460; height: 760 }`. It obtains the
@@ -573,6 +652,13 @@ The tab index ↔ page mapping (used by the `selectTab(i)` helper) is:
 | 4 | **History** | "Recent activity"; "Refresh history" button; `historyEmpty` "No transactions yet" placeholder; per-tx rows (kind · status · hash), colored by status | `historyJson` | `refreshHistory(acct)`, plus event-driven refills via `tx_status_changed` |
 | 5 | **Settings** | proxy URL field (`placeholderText: socks5h://127.0.0.1:9050`), "Require proxy (fail-closed)" checkbox, **Apply proxy** | — | `setProxyConfig` |
 | 6 | **Advanced** | chain id / name / RPC URL / symbol / optional Multicall3 fields, **Test endpoint**, **Save chain**; "Configured networks" list; seed phrase + account label + passphrase, **Import** | `chainsJson` | `testEndpoint`, `setChains`, `importMnemonic` |
+| 7 | **Private** | "Private balance"; `privateSyncLeg` / `privateSyncState` labels, `privateSyncProgress` bar, `privateSyncProgressText` (`% · blocks to go · about N s left`), `privateSyncNote` / `privateSyncError`; **Check** / **Sync now** / **Cancel** | `privateSyncJson` | `refreshPrivateSync`, `startPrivateSync`, `cancelPrivateSync` |
+
+**Private is index 7 — appended, not placed next to Send.** The doc-tests and this table drive
+the bar by index (`call_method → selectTab(i)`), so a tab inserted in the middle renumbers
+every page below it; that renumbering is what the RAILGUN tab's first arrival and removal both
+cost. `selectTab(7)` also calls `refreshPrivateSync()`, which is one `eth_blockNumber`, so the
+page never shows a stale percentage.
 
 The view parses each JSON PROP through a small `parseField(json, field, fallback)` helper
 (e.g. `chainsJson → .chains`, `marketJson → .chains`, `balancesJson → .balances`).

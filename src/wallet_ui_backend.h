@@ -47,6 +47,11 @@ public:
     // History
     void refreshHistory(QString address) override;
 
+    // Private (RAILGUN) — see the .cpp for why this variant refuses by name.
+    void refreshPrivateSync() override;
+    QString startPrivateSync() override;
+    QString cancelPrivateSync() override;
+
 private:
     // Shared by sendNative/sendErc20: record the request id and tell the user
     // where the decision happens.

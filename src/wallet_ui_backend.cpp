@@ -73,6 +73,11 @@ void WalletUiBackend::onContextReady()
         }
     });
 
+    // The Private tab has something true to show from the first paint: this
+    // build carries no railgun_module, and says so rather than rendering an
+    // empty progress bar.
+    refreshPrivateSync();
+
     setStatusText(QStringLiteral("Ready"));
 }
 
@@ -237,4 +242,61 @@ QString WalletUiBackend::sendStatus(QString requestId)
 void WalletUiBackend::refreshHistory(QString address)
 {
     setHistoryJson(modules().wallet_backend_module.get_history(address));
+}
+
+// ── the private sync: not on this side of the wallet ─────────────────────────
+//
+// THE PRIVATE SEND LIVES ON A PHONE. `railgun_module` is a Bundled member of a
+// mobile image and is reached by the wallet's `web` variant, which is the half
+// that runs there (logos-basecamp ships it as LOGOS_SHELL_WEB_MODULES=wallet_ui).
+// This desktop plugin talks to `wallet_backend_module`, and the coordinator does
+// not name railgun in its dependencies — checked again this cycle — so there is
+// no private send behind this build and nothing here to report progress for.
+//
+// REFUSED BY NAME rather than answered with a plausible 0 %, which is the rule
+// the `web` variant follows in the other direction for the coordinator's own
+// surface: a user is told the variant cannot do it and a developer is told which
+// module would have served it. The SHAPE is the contract's, so the same QML
+// renders both halves — `state: "unavailable"` is a state the Private tab knows.
+//
+// What it would take to lift this: `railgun_module` in this module's
+// `dependencies` and in its flake, which puts the whole RAILGUN engine (a Rust
+// crate with the Groth16 circuits) into every desktop wallet build. That is a
+// trade worth making when the desktop wallet has a private send to offer, and
+// not before.
+namespace {
+
+const QString kRailgunAbsent =
+    QStringLiteral("Private sends need railgun_module, which this desktop build does not "
+                   "carry — the wallet's `web` variant on a phone is the half that has it.");
+
+QString privateSyncUnavailable()
+{
+    QJsonObject sync;
+    sync.insert(QStringLiteral("leg"), QStringLiteral("sync"));
+    sync.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
+    sync.insert(QStringLiteral("error"), kRailgunAbsent);
+    return jsonText(QJsonObject{ { QStringLiteral("sync"), sync } });
+}
+
+} // namespace
+
+void WalletUiBackend::refreshPrivateSync()
+{
+    setPrivateSyncJson(privateSyncUnavailable());
+}
+
+QString WalletUiBackend::startPrivateSync()
+{
+    setPrivateSyncJson(privateSyncUnavailable());
+    setStatusText(kRailgunAbsent);
+    return jsonText(QJsonObject{ { QStringLiteral("ok"), false },
+                                 { QStringLiteral("error"), kRailgunAbsent } });
+}
+
+QString WalletUiBackend::cancelPrivateSync()
+{
+    // Nothing is running, so there is nothing to stop — and saying "cancelled"
+    // for a walk that never started would be the one answer worse than a refusal.
+    return startPrivateSync();
 }
