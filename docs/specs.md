@@ -672,6 +672,43 @@ user is the same and the difference is said rather than hidden.
 - **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":…}` for a send that has
   been broadcast or one that is not running.
 
+##### On a device
+
+iPad Air 13-inch (M2) simulator, Bundled set
+`capability_module,eth_rpc_module,uniswap_module,token_list_module,railgun_module`,
+`LOGOS_SHELL_WEB_MODULES=wallet_ui,keystore_module`.
+
+**The route is published by the page itself, from the first paint:**
+
+```
+[shell] wallet_ui page [log]: [wallet_ui web] private send idle:
+  {"cancellable":false,"leg":"","legs":[{"name":"sync","state":"pending"},
+   {"name":"prove","state":"pending"},{"name":"approve","state":"pending"},
+   {"name":"broadcast","state":"pending"}],
+   "note":"No private send has been started.","state":"idle"}
+[shell] wallet_ui page [log]: [logos-web-view wallet_ui] contract query answered: 40 method(s)
+```
+
+**And the wire the `prove` leg uses is `railgun_module`'s own, checked against it directly:**
+
+```
+[shell] CALL OK railgun_module.relayed_send(str:{…,"amount":"1000"})
+        -> {"error":"bad relayed-send params: missing field `owner` at line 1 column 122","ok":false}
+[shell] CALL OK railgun_module.relayed_send(str:{…,"owner":"0x493A…","bundlerUrl":"https://bundler.invalid/rpc"})
+        -> {"error":"railgun_module not initialized (call init first)","ok":false}
+```
+
+The first is the module naming the field this wallet sends; the second is a well-formed
+document getting past the parse. So the argument typing the backend uses — a `str:` JSON
+document with `to` / `asset` / `amount` / `memo` / `owner` / `bundlerUrl` — is the module's,
+confirmed on hardware and not inferred from its source.
+
+**What could NOT be driven on a device: pressing the controls.** Nothing outside the app can
+press a control in a `web` app's page — `--call` on a `ui_qml` module's `.rep` SLOT answers
+`(no value)` and runs nothing, and `idb ui tap`/`text` are dropped under this venue's
+Xcode 27. The Shell's own `ShellWebInputDriver` can (it types and presses by objectName and
+accessible name) but knows one hardcoded flow; extending it is logos-workspace#238.
+
 ##### Should the sync run in the background before a send? (logos-workspace#235, clause 4)
 
 **The distance is read automatically; the walk is started by the thing that needs it.**
