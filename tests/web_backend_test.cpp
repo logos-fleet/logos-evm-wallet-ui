@@ -168,9 +168,11 @@ void theApproverSetNamesAnApproverThisImageCarries()
     if (!configured)
         return;
 
-    const QJsonObject roles = parse(configured->args.isEmpty()
-                                        ? QString()
-                                        : configured->args.at(0).toString());
+    // The document itself, kept so every refusal below can quote the whole of
+    // what was sent rather than the one field it looked at.
+    const QString document =
+        configured->args.isEmpty() ? QString() : configured->args.at(0).toString();
+    const QJsonObject roles = parse(document);
 
     // A role may be one name or a list of them; read both shapes as a set, so
     // this asserts membership rather than a spelling.
@@ -188,18 +190,18 @@ void theApproverSetNamesAnApproverThisImageCarries()
     check(approvers.contains(QStringLiteral("evm_signer_cli")),
           QStringLiteral("the approver role does not name the headless signer, so nothing on a "
                          "phone can answer request_approval: %1")
-              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+              .arg(document));
     check(approvers.contains(QStringLiteral("evm_signer_ui")),
           QStringLiteral("naming the headless signer revoked the Signer app's approval — "
                          "configure is TOTAL: %1")
-              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+              .arg(document));
 
     // ...and the custodians are untouched by the same argument.
     const QStringList custodians = holdersOf(QStringLiteral("custodians"));
     check(custodians.contains(QStringLiteral("evm_keystore_ui"))
               && custodians.contains(QStringLiteral("wallet_ui")),
           QStringLiteral("the custodian set lost a holder: %1")
-              .arg(configured->args.isEmpty() ? QString() : configured->args.at(0).toString()));
+              .arg(document));
 
     if (failures == before)
         pass("the role document names an approver this image carries, without revoking the one "

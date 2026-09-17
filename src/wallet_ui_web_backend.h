@@ -408,9 +408,11 @@ private:
     //
     // One ungated round trip, immediately before the ask, which is the only
     // place that can be sure: the request about to be lodged is the one that
-    // needs an approver. `then` runs only when the roles are in force; a refusal
-    // goes to `refused` because the shield and the send fail their own legs in
-    // their own words.
+    // needs an approver. It sends the SAME document `takeCustodianRole` sends —
+    // `configure` is total, so there is only one — and the two differ only in
+    // the role each reports and in how each says a refusal. `then` runs only
+    // when the roles are in force; a refusal goes to `refused` rather than to
+    // the status line, because the shield fails its own leg in its own words.
     void nameAnApprover(std::function<void()> then,
                         std::function<void(const QString&)> refused);
     // Announce and show a refused keystore call, in the two places every refusal

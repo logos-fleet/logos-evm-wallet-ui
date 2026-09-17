@@ -48,7 +48,7 @@ bool replyOk(const QString& replyJson)
 // headless one, which holds the same role under the same gate and answers over
 // method calls instead of a window. A desktop that has the Signer app keeps it
 // — this is an addition — and an image that has only the CLI can still approve.
-QString custodianRoles()
+QString keystoreRoles()
 {
     QJsonObject roles;
     roles.insert(QStringLiteral("approvers"),
@@ -133,7 +133,7 @@ QString WalletUiBackend::createAccount(QString passphrase, QString label)
     //
     // TAKE THE ROLE, THEN MUTATE: the mutation is refused until the role is in
     // force, so a refusal here is reported instead of asking for the account.
-    const QString configured = modules().keystore_module.configure(custodianRoles());
+    const QString configured = modules().keystore_module.configure(keystoreRoles());
     if (!replyOk(configured)) {
         setStatusText(QStringLiteral("keystore_module refused configure"));
         return configured;

@@ -181,7 +181,7 @@ QString jsonText(const QJsonArray& arr)
 // a Bundled member of the mobile app image beside this wallet. Naming it here
 // does not admit it: the keystore admits a CONFIGURED approver, and this is the
 // document that configures one.
-QString custodianRoles()
+QString keystoreRoles()
 {
     QJsonObject roles;
     roles.insert(QStringLiteral("approvers"),
@@ -688,7 +688,7 @@ void WalletUiWebBackend::claimCustody(std::function<void()> then)
 void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
 {
     logos::web::callModuleAsync(
-        kKeystore, QStringLiteral("configure"), QJsonArray{ custodianRoles() },
+        kKeystore, QStringLiteral("configure"), QJsonArray{ keystoreRoles() },
         [this, then](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (keystoreRefused(QStringLiteral("configure"), res, reply))
@@ -700,10 +700,10 @@ void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
 }
 
 void WalletUiWebBackend::nameAnApprover(std::function<void()> then,
-                                       std::function<void(const QString&)> refused)
+                                        std::function<void(const QString&)> refused)
 {
     logos::web::callModuleAsync(
-        kKeystore, QStringLiteral("configure"), QJsonArray{ custodianRoles() },
+        kKeystore, QStringLiteral("configure"), QJsonArray{ keystoreRoles() },
         [this, then, refused](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
