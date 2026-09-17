@@ -14,7 +14,7 @@ intro: |
   (`QT_QPA_PLATFORM=offscreen`) and drives it through the QML inspector with
   [`logos-qt-mcp`](https://github.com/logos-co/logos-qt-mcp): it waits for the UI
   to come up, **navigates every tab** (Balances → Market → Send → Tokens →
-  History → Settings → Advanced) through the view's `selectTab` helper,
+  History → Settings → Advanced → Private) through the view's `selectTab` helper,
   and on the Settings tab applies a SOCKS5 proxy — a real `set_proxy_config`
   round-trip into the bundled backend that flips the status to **Proxy applied** —
   capturing screenshots along the way.
@@ -176,6 +176,22 @@ sections:
               texts: ["Custom network"]
               timeout: 15000
               screenshot: "wallet-ui-advanced.png"
+            # The Private tab is the accumulator sync a RAILGUN private send
+            # waits on (logos-workspace#235). On the DESKTOP it renders the
+            # refusal, because this build carries no railgun_module — which is
+            # the state worth having in a doc-test: the page is reachable, and it
+            # names the module that would have filled it in.
+            - name: "Switch to the Private tab"
+              action: call_method
+              find_by: "objectName"
+              find_value: "walletRoot"
+              method: "selectTab"
+              args: [7]
+            - name: "Private tab rendered"
+              action: wait_for
+              texts: ["Private balance", "Sync now"]
+              timeout: 15000
+              screenshot: "wallet-ui-private.png"
         post_text: |
           A rendered, interactive UI whose **Apply proxy** action flips the status
           to *Proxy applied* is end-to-end proof that the QML view, the bundled

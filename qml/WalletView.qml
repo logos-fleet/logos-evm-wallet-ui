@@ -58,11 +58,42 @@ Item {
     readonly property var tokens: parseField(backend ? backend.tokensJson : "", "tokens", [])
     readonly property var history: parseField(backend ? backend.historyJson : "", "history", [])
     readonly property var market: parseField(backend ? backend.marketJson : "", "chains", [])
+    // The one leg of a private send that reports progress. See the Private tab
+    // below, and `privateSyncJson` in wallet_ui.rep for the shape.
+    readonly property var privateSync: parseField(backend ? backend.privateSyncJson : "", "sync", ({}))
+    // Where Private sits in the tab bar. Named because selectTab, the tab bar
+    // and docs/specs.md all have to quote the same number — see the tab bar
+    // below for why it is APPENDED rather than placed next to Send.
+    readonly property int privateTabIndex: 7
 
     function parseField(json, field, fallback) {
         if (!json) return fallback
         try { var o = JSON.parse(json); return (o && o[field] !== undefined) ? o[field] : fallback }
         catch (e) { return fallback }
+    }
+
+    // The colour the Private tab reads a sync state in. A function rather than a
+    // chain of ternaries in the binding: the states are a closed set (see the
+    // `kState*` constants in wallet_ui_web_backend.cpp), and this is where the
+    // set is matched, one line each.
+    function privateSyncColor(state) {
+        if (state === "unavailable") return Theme.palette.error
+        if (state === "done") return Theme.palette.success
+        if (state === "running") return Theme.palette.warning
+        return Theme.palette.textSecondary
+    }
+
+    // "40%  ·  600 blocks to go  ·  about 6 s left" — joined from the parts that
+    // are actually there, so a plan carrying a percentage but no block count or
+    // no ETA reads as a shorter line rather than one ending in a separator with
+    // nothing after it.
+    function privateSyncProgressLine(sync) {
+        var parts = [sync.percent + "%"]
+        if (sync.blocksRemaining !== undefined)
+            parts.push(sync.blocksRemaining + " blocks to go")
+        if (sync.etaMs != null)
+            parts.push("about " + Math.round(sync.etaMs / 1000) + " s left")
+        return parts.join("  ·  ")
     }
 
     // WHAT THIS VIEW IS RENDERING, on the console, the moment it renders it.
@@ -85,7 +116,14 @@ Item {
     // `call_method` (find_by objectName "walletRoot", method "selectTab", args [i]),
     // the same pattern the tutorial QML UI uses for coreModulesView.openInterface.
     // Switching the tab makes that page's controls visible/findable to qt-mcp.
-    function selectTab(i) { tabs.currentIndex = Number(i) }
+    function selectTab(i) {
+        tabs.currentIndex = Number(i)
+        // Opening Private re-reads how far behind the accumulator is. One
+        // `eth_blockNumber` and no chain walk, so it is cheap enough to do on
+        // every visit and is what stops the page showing a stale percentage.
+        if (tabs.currentIndex === root.privateTabIndex && root.ready && backend)
+            backend.refreshPrivateSync()
+    }
 
     // Take (or re-take) the backend, and SAY WHICH HALF IS MISSING.
     //
@@ -188,6 +226,11 @@ Item {
             LogosTabButton { text: "History" }
             LogosTabButton { text: "Settings" }
             LogosTabButton { text: "Advanced" }
+            // APPENDED RATHER THAN PLACED NEXT TO Send, and deliberately: the
+            // doc-tests and docs/specs.md drive this bar by INDEX
+            // (call_method → selectTab(i)), so a tab inserted in the middle
+            // renumbers every page below it. Private is 7.
+            LogosTabButton { text: "Private" }
         }
 
         StackLayout {
@@ -460,6 +503,121 @@ Item {
                         }
                     }
                     LogosText { id: advAcctResult; Layout.fillWidth: true; elide: Text.ElideMiddle; color: Theme.palette.textSecondary; font.pixelSize: Theme.typography.secondaryText }
+                }
+            }
+
+            // ── 7 · Private (RAILGUN) — the sync a private send waits on ──
+            //
+            // WHY A TAB FOR ONE NUMBER. A RAILGUN private send measured ~154 s on
+            // a simulator and 239 s on a physical iPad, and ~92 % of that is the
+            // accumulator sync — the witness, the Groth16 proof and the verify
+            // together are 3.7 s (logos-workspace#235, #213). Nothing told the
+            // user, and the driver watching it gave up at 60 s on work that went
+            // on to succeed. This page is the sync made visible: which leg is
+            // running, how far it has got, what it has left to do, and a control
+            // that stops it.
+            //
+            // IT IS NOT A SEND. There is no private-send flow in this wallet yet;
+            // what exists is the module's API and the long leg in front of it. So
+            // the page shows the leg, states plainly that it is the one a send
+            // waits on, and lets a user get it out of the way BEFORE they need it
+            // — which is the answer this view gives to "should the sync run in
+            // the background": the distance is read automatically and costs one
+            // RPC, the walk is asked for and then runs on its own.
+            LogosScrollView {
+                clip: true
+                ColumnLayout {
+                    width: pages.width - 16
+                    spacing: Theme.spacing.small
+
+                    LogosText { text: "Private balance"; font.weight: Theme.typography.weightBold }
+                    LogosText {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        text: "A private send has to walk the RAILGUN accumulator up to the chain " +
+                              "head first. That walk is minutes on a phone and is almost all of " +
+                              "what a private send costs — the proof itself is about four seconds."
+                    }
+
+                    // WHICH LEG IS RUNNING, in so many words. `sync` is the only
+                    // leg that reports progress today; the rest of a send (wrap /
+                    // approve / shield / prove / broadcast) are short calls with
+                    // no window to show, and this line does not pretend otherwise.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        LogosText {
+                            objectName: "privateSyncLeg"
+                            text: "leg: " + (root.privateSync.leg || "sync")
+                            font.weight: Theme.typography.weightBold
+                        }
+                        LogosText {
+                            objectName: "privateSyncState"
+                            Layout.fillWidth: true
+                            text: root.privateSync.state || "unknown"
+                            color: root.privateSyncColor(root.privateSync.state)
+                        }
+                    }
+
+                    // THE APP HAS NOT HUNG, and here is the evidence: a bar that
+                    // moves, a block count that falls, and an ETA the engine
+                    // measured rather than one this view guessed.
+                    LogosProgressBar {
+                        objectName: "privateSyncProgress"
+                        Layout.fillWidth: true
+                        visible: root.privateSync.percent !== undefined
+                        from: 0; to: 100
+                        value: Number(root.privateSync.percent || 0)
+                    }
+                    LogosText {
+                        objectName: "privateSyncProgressText"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textSecondary
+                        visible: root.privateSync.percent !== undefined
+                        text: root.privateSyncProgressLine(root.privateSync)
+                    }
+                    LogosText {
+                        objectName: "privateSyncNote"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        visible: text.length > 0
+                        text: root.privateSync.note || ""
+                    }
+                    LogosText {
+                        objectName: "privateSyncError"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.error
+                        visible: text.length > 0
+                        text: root.privateSync.error || ""
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        LogosButton {
+                            objectName: "privateSyncCheckButton"
+                            text: "Check"; enabled: root.ready
+                            onClicked: backend.refreshPrivateSync()
+                        }
+                        // ONE WALK AT A TIME: the backend refuses a second start,
+                        // and the control says so before it is pressed.
+                        LogosButton {
+                            objectName: "privateSyncStartButton"
+                            text: "Sync now"
+                            enabled: root.ready && root.privateSync.state !== "running"
+                            onClicked: logos.watch(backend.startPrivateSync(),
+                                                   function (r) {}, function (e) {})
+                        }
+                        // LEAVING IS SAFE, AND THE PAGE SAYS WHY once it is
+                        // pressed: the backend stops asking for windows and the
+                        // note that lands names the block the walk reached and
+                        // what a mined shield does (nothing — it stays shielded).
+                        LogosButton {
+                            objectName: "privateSyncCancelButton"
+                            text: "Cancel"
+                            enabled: root.ready && root.privateSync.state === "running"
+                            onClicked: logos.watch(backend.cancelPrivateSync(),
+                                                   function (r) {}, function (e) {})
+                        }
+                    }
                 }
             }
         }

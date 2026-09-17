@@ -37,6 +37,18 @@ const QString kTokenList = QStringLiteral("token_list_module");
 // chain list's `nativeSymbol` is that, and is what the item is labelled with.
 const QString kNativeAsset = QStringLiteral("ETH");
 
+// THE FIVE WORDS `privateSyncJson.sync.state` IS EVER ONE OF, spelled once.
+// They are a contract, not a message: WalletView.qml colours the state label by
+// them and docs/specs.md lists them, so a typo here is a state nothing renders
+// and nothing complains about. Naming them also keeps them apart from the
+// module's own `done` FIELD, which is spelled the same and means something
+// else. See "the private sync" section near the bottom of this file.
+const QString kStateIdle = QStringLiteral("idle");
+const QString kStateRunning = QStringLiteral("running");
+const QString kStateDone = QStringLiteral("done");
+const QString kStateCancelled = QStringLiteral("cancelled");
+const QString kStateUnavailable = QStringLiteral("unavailable");
+
 // How often the startup wait asks whether the page has a channel yet, and how
 // long it waits before saying it has not. A minute: a cold phone launch mounts
 // a webview, fetches a document and instantiates a ~26 MB runtime beside this
@@ -61,8 +73,14 @@ constexpr int kStartupGiveUpMs = 60000;
 // are close together — six over three seconds rather than one wait of two.
 // A phone's first paint of the account list is the thing being spent here.
 constexpr int kAdmissionSettleMs = 250;
-constexpr int kAccountRetries = 6;
-constexpr int kAccountRetryMs = 500;
+// THE RETRY BUDGET FOR THAT RACE, shared by every first ask this variant makes.
+// Not the account list's alone: measured on an iPad Air 13-inch simulator, the
+// keystore AND railgun were both refused "token not recognized (re-exchange
+// failed)" in the same turn, and only the ask that retried ever got an answer
+// (logos-workspace#235). Bounded, because a module that really is absent must
+// be REPORTED rather than polled for the life of the page.
+constexpr int kAdmissionRetries = 6;
+constexpr int kAdmissionRetryMs = 500;
 
 // Every rust-first module on this wire answers a JSON TEXT, not a structure,
 // so a reply is parsed before it is read.
@@ -208,6 +226,11 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     setAccountsJson(QStringLiteral("{\"accounts\":[]}"));
     setBalancesJson(QStringLiteral("{\"balances\":{\"chains\":[]}}"));
     setStatusText(QStringLiteral("Ready — balances through eth_rpc_module"));
+    // Something true on the Private tab from the first paint: nothing is known
+    // about the accumulator yet, and an empty bar that claimed 0 % would be a
+    // guess. The first `sync_status` replaces this the moment the page is
+    // admitted.
+    publishPrivateSync(kStateIdle, QJsonObject{}, QStringLiteral("Not checked yet."));
 
     // AUTOMATIC, AND ONLY AT THE EDGES. The view already picks the first
     // account as soon as one exists (WalletView.qml's `onCountChanged`), and it
@@ -257,8 +280,14 @@ void WalletUiWebBackend::startWhenReachable()
                          .arg(m_startupTicks * kStartupPollMs)
                          .arg(kKeystore)
                          .arg(kAdmissionSettleMs));
-            QTimer::singleShot(kAdmissionSettleMs, this,
-                               [this]() { refreshAccounts(); });
+            QTimer::singleShot(kAdmissionSettleMs, this, [this]() {
+                refreshAccounts();
+                // AND HOW FAR BEHIND THE PRIVATE BALANCE IS, before anything is
+                // offered. One `eth_blockNumber` and no chain walk — #235's
+                // fourth question answered at the cheap end: the DISTANCE is
+                // taken automatically, the WALK is not (see refreshPrivateSync).
+                refreshPrivateSync();
+            });
             return;
         }
         ++m_startupTicks;
@@ -463,8 +492,8 @@ void WalletUiWebBackend::refreshAccounts()
                 setStatusText(QStringLiteral("keystore_module: %1").arg(res.error));
                 // See kAdmissionSettleMs: a refusal this early is a race with
                 // the core's own load path, not an answer.
-                if (m_accountRetries++ < kAccountRetries)
-                    QTimer::singleShot(kAccountRetryMs, this,
+                if (m_accountRetries++ < kAdmissionRetries)
+                    QTimer::singleShot(kAdmissionRetryMs, this,
                                        [this]() { refreshAccounts(); });
                 return;
             }
@@ -1107,4 +1136,257 @@ void WalletUiWebBackend::refreshHistory(QString address)
     Q_UNUSED(address)
     refuse(QStringLiteral("History"), QStringLiteral("wallet_backend_module"));
     setHistoryJson(QStringLiteral("{\"history\":[]}"));
+}
+
+// ── the private sync: railgun_module, one window at a time ───────────────────
+//
+// WHAT IS BEING MITIGATED. A RAILGUN private send measured ~154 s on an iPad
+// simulator and 239 s on a physical iPad Air 4, and ~92 % of that is the
+// accumulator sync: witness + Groth16 prove + verify together are 3.7 s
+// (logos-workspace#235, #213). `railgun_module.sync()` does that sync in ONE
+// call which reports nothing, cannot be interrupted, and outlasts any caller's
+// timeout. `sync_step` / `sync_status` / `sync_cancel` are the same work in
+// bounded windows, and this section is the wallet asking for them.
+//
+// WHY railgun_module IS NOT IN THIS VARIANT'S `web.dependencies`. The core
+// resolves a module's declared dependencies before loading it and REFUSES a
+// module whose list it cannot satisfy. `railgun_module` is a Bundled member an
+// image carries only when it was asked for (`--bundle railgun_module`), and
+// declaring it would mean a build without it could not load the wallet at
+// all — trading every wallet build for a tab. So the private surface is
+// DISCOVERED instead: the wallet asks, and a build that does not carry railgun
+// answers a refusal this file publishes as `unavailable` with the reason in it.
+// That is the same shape the catalog's derived floor takes for
+// `token_list_module` (ADR 0009) — a control a user can see refusing, rather
+// than a module that silently will not start.
+//
+// ONE WINDOW IN FLIGHT AT A TIME, always. The next `sync_step` is issued from
+// inside the last one's reply, which is the rule every chained call in this
+// file follows (logos_web_module_call.h: "a backend that needs a sequence
+// chains it in the callbacks"), and here it also carries the cancel: with never
+// more than one window outstanding, "stop" is simply "do not ask for another".
+namespace {
+
+// The module that owns the accumulator. Reached by name and not declared —
+// see the section header for why.
+const QString kRailgun = QStringLiteral("railgun_module");
+
+// HOW BIG A WINDOW A VIEW WANTS, which is not the module's own default. A
+// `sync_step` with no budget runs for 20 000 ms, so a progress bar would move
+// three times a minute; 5 s is a window a user reads as motion and is still
+// long enough that the per-call overhead is noise against it. The block count
+// is the module's own default — it is the subsquid frontier, taken whole in one
+// window, that decides a cold sync's shape, not this number.
+constexpr int kSyncWindowBlocks = 25000;
+constexpr int kSyncWindowBudgetMs = 5000;
+
+// WHAT A CANCEL LEAVES BEHIND, in the words the module guarantees. Not a
+// reassurance written by a view: `UtxoIndexer::sync_to` persists `synced_block`
+// before each window returns, so every window that completed is on disk and a
+// later step — or a later launch — resumes from there. A shield that is already
+// mined is the chain's, owned by this wallet's 0zk address, and the next sync of
+// any length finds it. Cancelling after a shield therefore leaves a shielded
+// balance and no transfer, which is a state the wallet can show and spend from.
+QString cancelNote(qint64 keptToBlock)
+{
+    return QStringLiteral(
+               "Stopped at block %1 — nothing was rolled back. A shield that is already "
+               "mined is untouched: it leaves a shielded balance and no transfer, and the "
+               "next sync resumes from here.")
+        .arg(keptToBlock);
+}
+
+} // namespace
+
+// `sync_status` costs one `eth_blockNumber` and walks nothing, which is what
+// makes it safe to ask before a send is offered rather than after: "this device
+// is 2 200 blocks behind" is the difference between a send that is instant and
+// one that is four minutes.
+//
+// IT DOES NOT START THE WALK. That is `startPrivateSync`, and the split is the
+// answer to #235's fourth question — whether the sync should run in the
+// background before the user asks to send. Knowing the distance is one RPC and
+// is taken automatically; WALKING it is minutes of chain traffic on a phone's
+// radio for a user who may never send privately, so it stays a thing the user
+// asks for. Once asked for it does run in the background: the windows chain on
+// through tab switches and the rest of the wallet stays usable.
+void WalletUiWebBackend::refreshPrivateSync()
+{
+    announce(QStringLiteral("refreshPrivateSync: asking %1, %2").arg(kRailgun, doorState()));
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("sync_status"), QJsonArray{},
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                // A REFUSAL BY THE DOOR THIS EARLY IS A RACE, NOT AN ANSWER —
+                // the same one `refreshAccounts` retries through, and the same
+                // words ("token not recognized"). `res.ok` false is the door's
+                // own failure; a module that answered `{ok:false}` has decided,
+                // and is published straight away.
+                if (!res.ok && m_privateSyncRetries++ < kAdmissionRetries) {
+                    announce(QStringLiteral("%1 refused sync_status (%2/%3): %4")
+                                 .arg(kRailgun)
+                                 .arg(m_privateSyncRetries)
+                                 .arg(kAdmissionRetries)
+                                 .arg(res.error));
+                    QTimer::singleShot(kAdmissionRetryMs, this,
+                                       [this]() { refreshPrivateSync(); });
+                    return;
+                }
+                privateSyncUnavailable(QStringLiteral("sync_status"), res, reply);
+                return;
+            }
+            m_privateSyncRetries = 0;
+            m_syncPlan = reply;
+            // A WALK IN FLIGHT OUTRANKS THE READ. `sync_status` answers
+            // `running` for a plan the MODULE holds; this variant knows whether
+            // it is the one still asking for windows, and that is what the view
+            // needs to decide between a Sync button and a Cancel button.
+            if (m_syncRunning) {
+                publishPrivateSync(kStateRunning, reply);
+                return;
+            }
+            const bool done = reply.value(QStringLiteral("done")).toBool();
+            publishPrivateSync(done ? kStateDone : kStateIdle, reply);
+        });
+}
+
+QString WalletUiWebBackend::startPrivateSync()
+{
+    if (m_syncRunning) {
+        // NOT a second walk. Two chains of windows against a `single`-concurrency
+        // module would queue behind each other and double the traffic for one
+        // plan, and the view would see a percentage flip between two readings of
+        // it.
+        return failed(QStringLiteral("A private sync is already running"));
+    }
+    m_syncRunning = true;
+    m_syncCancelled = false;
+    setStatusText(QStringLiteral("Syncing the private balance…"));
+    publishPrivateSync(kStateRunning, m_syncPlan);
+    stepPrivateSync();
+    return accepted();
+}
+
+void WalletUiWebBackend::stepPrivateSync()
+{
+    QJsonObject params;
+    params.insert(QStringLiteral("blocks"), kSyncWindowBlocks);
+    params.insert(QStringLiteral("budgetMs"), kSyncWindowBudgetMs);
+    // A JSON STRING, not an object. `sync_step(params_json: String)` takes its
+    // document as text and refuses an object by name — which cost a device run
+    // to find (#235), and is how every rust-first module on this wire is asked.
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("sync_step"), QJsonArray{ jsonText(params) },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                m_syncRunning = false;
+                privateSyncUnavailable(QStringLiteral("sync_step"), res, reply);
+                return;
+            }
+            m_syncPlan = reply;
+
+            // THE CANCEL LANDS HERE. `cancelPrivateSync` cannot unmake the
+            // window that was already in flight, and does not try to: it marks
+            // the walk as left, and this is where the next one is not asked for.
+            if (m_syncCancelled) {
+                m_syncRunning = false;
+                return;
+            }
+            if (reply.value(QStringLiteral("done")).toBool()) {
+                m_syncRunning = false;
+                setStatusText(QStringLiteral("Private balance is up to date"));
+                publishPrivateSync(kStateDone, reply);
+                return;
+            }
+            // NOTHING MOVED. The module says so rather than letting a caller
+            // loop on it: an engine that could not pass this block will not pass
+            // it on the next turn either, and a spin is worse than a stall.
+            if (reply.value(QStringLiteral("stalled")).toBool()) {
+                m_syncRunning = false;
+                publishPrivateSync(
+                    kStateIdle, reply,
+                    QStringLiteral("The sync stopped making progress at block %1. "
+                                   "Everything up to there is saved; try again later.")
+                        .arg(reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong()));
+                return;
+            }
+            publishPrivateSync(kStateRunning, reply);
+            stepPrivateSync();
+        });
+}
+
+// STOP ASKING — and say what that left. There is nothing to roll back, so this
+// is not an undo and does not pretend to be one: `sync_cancel` drops the pinned
+// target so the next step plans against a fresh head, and answers how far the
+// cancelled walk got. See `cancelNote` for the state it leaves.
+QString WalletUiWebBackend::cancelPrivateSync()
+{
+    m_syncCancelled = true;
+    setStatusText(QStringLiteral("Stopping the private sync…"));
+    logos::web::callModuleAsync(
+        kRailgun, QStringLiteral("sync_cancel"), QJsonArray{},
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            m_syncRunning = false;
+            if (!callSucceeded(res, reply)) {
+                privateSyncUnavailable(QStringLiteral("sync_cancel"), res, reply);
+                return;
+            }
+            m_syncPlan = reply;
+            // `keptToBlock` is only on a cancel that HAD a plan to drop; a cancel
+            // with none still reports where the engine stands, which is the same
+            // number under the plan's own name.
+            const qint64 kept =
+                reply.contains(QStringLiteral("keptToBlock"))
+                    ? reply.value(QStringLiteral("keptToBlock")).toVariant().toLongLong()
+                    : reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong();
+            setStatusText(QStringLiteral("Private sync stopped"));
+            publishPrivateSync(kStateCancelled, reply, cancelNote(kept));
+        });
+    return accepted();
+}
+
+void WalletUiWebBackend::publishPrivateSync(const QString& state, const QJsonObject& plan,
+                                            const QString& note, const QString& error)
+{
+    // THE MODULE'S OWN FIELDS, PASSED THROUGH. `startBlock`, `syncedBlock`,
+    // `targetBlock`, `blocksTotal/Done/Remaining`, `percent`, `windows`,
+    // `elapsedMs`, `etaMs` and `fastForwardTo` are what `Plan::to_json` wrote;
+    // copying them rather than recomputing any is what keeps the bar the engine's
+    // answer and not a second opinion about it.
+    QJsonObject sync = plan;
+    sync.remove(QStringLiteral("ok"));
+    // THE LEG, NAMED. #235 asks a view to say which leg of a private send is
+    // running — wrap / approve / shield / sync / prove / broadcast. `sync` is
+    // the one that takes the minutes and the only one `railgun_module` reports
+    // progress for today; the other five are short calls in its API and have no
+    // window to show.
+    sync.insert(QStringLiteral("leg"), QStringLiteral("sync"));
+    sync.insert(QStringLiteral("state"), state);
+    if (!note.isEmpty())
+        sync.insert(QStringLiteral("note"), note);
+    if (!error.isEmpty())
+        sync.insert(QStringLiteral("error"), error);
+
+    QJsonObject out;
+    out.insert(QStringLiteral("sync"), sync);
+    setPrivateSyncJson(jsonText(out));
+    announce(QStringLiteral("private sync %1: %2").arg(state, jsonText(sync)));
+}
+
+void WalletUiWebBackend::privateSyncUnavailable(const QString& method,
+                                                const logos::web::ModuleCallResult& res,
+                                                const QJsonObject& reply)
+{
+    const QString why = refusalReason(res, reply);
+    // NAMED, ALWAYS. A build that ships no railgun_module and a railgun_module
+    // that has not been initialised are the same blank tab to a user and two
+    // different fixes to a developer, so the module and its own words both go on
+    // the line.
+    const QString said = QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, why);
+    announce(said);
+    setStatusText(said);
+    publishPrivateSync(kStateUnavailable, QJsonObject{}, QString(), said);
 }

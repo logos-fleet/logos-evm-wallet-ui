@@ -18,6 +18,17 @@ class WalletUi
     PROP(QString historyJson READONLY)
     PROP(QString marketJson READONLY)
     PROP(QString proxyStatus="" READONLY)
+    // THE ONE LEG OF A PRIVATE SEND THAT CAN REPORT PROGRESS, as one JSON
+    // object: `{ "sync": { leg, state, percent, blocksRemaining, etaMs, … } }`.
+    //
+    // A private send is ~154 s on a phone and the accumulator sync is 92 % of
+    // it (logos-workspace#235); the witness, the Groth16 proof and the verify
+    // together are 3.7 s. `railgun_module` answers that sync in bounded windows
+    // (`sync_step` / `sync_status` / `sync_cancel`), so this PROP is refreshed
+    // between windows and a view has a real percentage and ETA rather than a
+    // spinner. `state` is idle / running / done / cancelled / unavailable, and
+    // the last of those carries the reason in `error`.
+    PROP(QString privateSyncJson READONLY)
 
     // Config / privacy
     SLOT(bool setProxyConfig(QString proxyJson))
@@ -56,4 +67,21 @@ class WalletUi
 
     // History
     SLOT(void refreshHistory(QString address))
+
+    // Private (RAILGUN) — the accumulator sync a private send waits on.
+    //
+    // `refreshPrivateSync` costs ONE `eth_blockNumber` and walks nothing, so it
+    // is what a wallet asks before it offers a private send: "this device is N
+    // blocks behind" is the difference between a send that is instant and one
+    // that is four minutes. `startPrivateSync` then walks it in windows,
+    // publishing `privateSyncJson` after each.
+    //
+    // `cancelPrivateSync` IS NOT AN UNDO, and there is nothing to undo: every
+    // window that completed is persisted, and a shield that is already mined is
+    // on chain and owned by the wallet's 0zk address. Cancelling after a shield
+    // leaves a shielded balance and no transfer — a state the wallet can show
+    // and spend from. The post-cancel `privateSyncJson` says so in `note`.
+    SLOT(void refreshPrivateSync())
+    SLOT(QString startPrivateSync())
+    SLOT(QString cancelPrivateSync())
 }
