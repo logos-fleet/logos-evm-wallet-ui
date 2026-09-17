@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 
 #include <functional>
@@ -103,6 +104,10 @@ public slots:
     // ...and the send the sync is a leg of.
     QString startPrivateSend(QString sendJson) override;
     QString cancelPrivateSend() override;
+
+    // ...and the other direction: public funds going INTO the pool.
+    QString startPrivateShield(QString shieldJson) override;
+    QString cancelPrivateShield() override;
 
 private:
     // THE VARIANT STARTS ITSELF. There is no onContextReady in a wasm image:
@@ -267,6 +272,87 @@ private:
     // its timer checks `m_sendRunning` before it asks again.
     void finishSend(const QString& state, const QString& note = QString(),
                     const QString& error = QString());
+
+    // ── the shield, run as its legs ──────────────────────────────────────────
+    //
+    // THE ROUTE INTO THE POOL, which is the half the send above cannot do
+    // without: `plan` (`prepare_shield` for the calldata, plus the account's
+    // nonce and the chain's gas price), `sign` (ONE approval request carrying
+    // every transaction of the route, answered once by a human in the Signer
+    // app), then `wrap`, `approve` and `shield` — each broadcast and then
+    // followed to its receipt.
+    //
+    // WHY ONE BUNDLE AND NOT THREE ASKS. `keystore_module` signs an intent's
+    // legs in order under a SINGLE key derivation, so the whole route is shown
+    // to the human together and costs one password entry. The legs are signed
+    // with CONSECUTIVE NONCES, so the chain executes the allowance before the
+    // shield without this wallet waiting for a receipt in between — which is
+    // what lets all three go out back to back and keeps the wait one wait.
+    //
+    // WHERE THE CANCEL LINE IS, and it is a harder line than the send's: up to
+    // the moment the first raw transaction is handed to eth_rpc there is
+    // nothing on chain and the request is withdrawn from the Signer's queue.
+    // After it, the transactions are the chain's — nonce-ordered and already
+    // in a mempool — and a cancel is REFUSED rather than pretended.
+    bool m_shieldRunning = false;
+    bool m_shieldCancelled = false;
+    // Flipped as the FIRST transaction is handed over, not as the last one is
+    // acknowledged: the point of no return is the handover, and a flag set on
+    // the reply would leave a window where a cancel answered "stopped" for
+    // something already in a mempool.
+    bool m_shieldBroadcast = false;
+    QString m_shieldLeg;
+    QJsonArray m_shieldLegs;
+    // `{chainId, owner, asset, amount, wrap}` as startPrivateShield normalised
+    // them — held because the route's later calls happen minutes later.
+    QJsonObject m_shieldParams;
+    // ONE ENTRY PER TRANSACTION, in the order they are signed and sent:
+    // `{leg, to, data, value, nonce, gasLimit}`, and `hash` once it has been
+    // broadcast. A leg can own more than one (`prepare_shield` answers an
+    // array), so the route's legs are derived from this list rather than the
+    // list being derived from the legs.
+    QJsonArray m_shieldTxs;
+    QString m_shieldHandle;
+    QString m_shieldReceipt;
+    QStringList m_shieldSigned;
+    int m_shieldSent = 0;
+    int m_shieldMined = 0;
+    // The nonce the account was at when the route was planned, and the fee the
+    // chain suggested — both read once, because every leg of one bundle has to
+    // agree about them.
+    quint64 m_shieldNonce = 0;
+    quint64 m_shieldMaxFee = 0;
+    quint64 m_shieldTip = 0;
+
+    void resetShieldRoute();
+    void setShieldLeg(const QString& leg, const QString& state);
+    QString shieldLegState(const QString& leg) const;
+    // The three reads the plan is made of, chained because two calls issued in
+    // one turn are answered in whatever order the container finishes them (see
+    // ensureChainConfig).
+    void shieldReadNonce();
+    void shieldReadGasPrice();
+    // Lay the transactions out with their nonces and fees. Answers the reason
+    // it could not, which is always something about the caller's own numbers.
+    QString buildShieldTxs();
+    // Put the whole bundle in front of a human, once.
+    void requestShieldApproval();
+    void pollShieldApproval();
+    void collectShieldSignatures();
+    // Hand the signed transactions to eth_rpc, in nonce order, without waiting
+    // for a receipt between them.
+    void broadcastShieldTx();
+    // The signatures are spent; let the keystore wipe its copy.
+    void ackShieldSignatures();
+    // ...and then follow each transaction to the block it landed in, which is
+    // the only part of this route whose length the chain decides.
+    void followShieldReceipt();
+    void withdrawShieldRequest();
+    void failShieldLeg(const QString& leg, const QString& why);
+    void publishPrivateShield(const QString& state, const QString& note = QString(),
+                              const QString& error = QString());
+    void finishShield(const QString& state, const QString& note = QString(),
+                      const QString& error = QString());
 
     QJsonObject chainById(int chainId) const;
     void seedDefaultChains();
