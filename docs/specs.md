@@ -257,6 +257,7 @@ auto-synced to the QML replica, where the view reads them as `backend.<prop>`.
 | `proxyStatus` | `QString` | READONLY | `"Proxy applied"` / `"Proxy failed"` after a proxy apply. Initial `""`. | `setProxyConfig` |
 | `privateSyncJson` | `QString` | READONLY | JSON `{"sync":{leg,state,percent,blocksRemaining,etaMs,…}}` — the RAILGUN accumulator sync a private send waits on. `state` is `idle` / `running` / `done` / `cancelled` / `unavailable`; the module's own plan fields are passed through unchanged. | `railgun_module.sync_status` / `sync_step` / `sync_cancel` (`web` variant only) |
 | `privateSendJson` | `QString` | READONLY | JSON `{"send":{state,leg,legs:[{name,state}],cancellable,requestId?,userOpHash?,note?,error?}}` — the private send the sync above is one leg of. `legs` is the whole route in order (`sync`, `prove`, `approve`, `broadcast`), each `pending` / `running` / `done` / `skipped` / `cancelled` / `failed`. | `railgun_module.relayed_send` / `relayed_send_status` / `relayed_send_cancel` (`web` variant only) |
+| `privateShieldJson` | `QString` | READONLY | JSON `{"shield":{state,leg,legs:[{name,state,hashes?}],cancellable,note?,error?}}` — the route that puts PUBLIC funds into the pool. `legs` is `plan`, `sign`, `wrap`, `approve`, `shield` in order, in the same state vocabulary as `privateSendJson`; a leg carries the transaction `hashes` it produced once they have been broadcast. | `railgun_module.prepare_shield`, `keystore_module.request_approval` / `approval_status` / `fetch_result` / `ack_result` / `cancel_approval`, `eth_rpc_module.get_transaction_count` / `gas_price` / `send_raw_transaction` / `get_transaction_receipt` (`web` variant only) |
 
 ### Slots (UI-callable methods)
 
@@ -530,9 +531,10 @@ Loads the locally-recorded, wallet-originated transactions for an account.
 
 #### Private (RAILGUN)
 
-The five slots behind the Private tab — a private send, and the accumulator walk in front of
-it. **Only the `web` variant serves them**; the desktop plugin refuses by name (see "Why the
-desktop half refuses" below).
+The seven slots behind the Private tab — a shield (public funds going into the pool), a
+private send (spending what is in it), and the accumulator walk both wait on. **Only the
+`web` variant serves them**; the desktop plugin refuses by name (see "Why the desktop half
+refuses" below).
 
 ##### `void refreshPrivateSync()`
 
@@ -639,9 +641,11 @@ coordinator owns sends and has no mobile build (which is why `sendNative` refuse
 `relayed_send` is the whole send inside the module, so the wallet drives it with two methods
 and a poll and every leg boundary is a reply that landed.
 
-**Four legs and not six.** `wrap` / `approve` / `shield` put funds *into* the shielded pool
-and end in public transactions this build cannot sign. This is the send of funds that are
-already shielded; the page names its own legs and invents none.
+**Four legs and not six.** `wrap` / `approve` / `shield` put funds *into* the pool and are a
+separate operation with a separate surface — see `startPrivateShield` below. This is the send
+of funds that are already in it; each page names its own legs and invents none, because a
+route showing three permanently-skipped legs would describe something this wallet never does
+in one go.
 
 - **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":…}` for a missing field
   or a send already in flight (one at a time — `railgun_module` is `concurrency: single`).
@@ -709,6 +713,77 @@ press a control in a `web` app's page — `--call` on a `ui_qml` module's `.rep`
 Xcode 27. The Shell's own `ShellWebInputDriver` can (it types and presses by objectName and
 accessible name) but knows one hardcoded flow; extending it is logos-workspace#238.
 
+##### `QString startPrivateShield(QString shieldJson)`
+
+**The other direction: public funds going INTO the pool** — the three legs logos-workspace#235
+names that the send above does not have (`wrap` / `approve` / `shield`), plus the two waits
+that are not the chain's.
+
+`shieldJson` is `{chainId, owner, asset, amount, wrap?}`. `owner` is the EOA that signs **and
+pays the gas** — unlike a private send, every leg here is an ordinary public transaction.
+`amount` is a decimal whole number in the asset's base units; anything that cannot be encoded
+into an ERC-20 argument is refused **here**, without a round trip.
+
+| leg | what runs | how it ends |
+|---|---|---|
+| `plan` | `railgun_module.prepare_shield` for the calldata, then `eth_rpc_module.get_transaction_count` and `gas_price` | `done` when all three have landed |
+| `sign` | ONE `keystore_module.request_approval` carrying the whole route, then `approval_status` once a second while a human decides, then `fetch_result` | `done` when the signatures are in hand, `failed` in the Signer's own word on a decline |
+| `wrap` | WETH9 `deposit()` on the asset, paid with `amount` | `running` when broadcast, `done` when mined; **`skipped`** when `wrap` was not asked for |
+| `approve` | `approve(spender, amount)` on the asset, where `spender` is the `to` **`prepare_shield` answered with** | `running` when broadcast, `done` when mined |
+| `shield` | the transaction(s) `prepare_shield` built, passed through unchanged | `running` when broadcast, `done` when mined |
+
+**One bundle, one human answer.** The keystore signs an intent's legs in order under a
+*single key derivation*, so the wrap, the allowance and the shield are rendered to the
+approver together (with their selectors and their full calldata) and cost one password entry.
+They are signed with **consecutive nonces** from the account's current one, which is what
+lets all three be broadcast back to back: the chain will not execute the shield before the
+allowance whatever order they reach a mempool in. Waiting for a receipt between them would
+cost the user a block time per leg and buy nothing.
+
+**The gas limits are stated, not estimated.** `eth_estimateGas` for the *shield* would be
+asked against a chain state where the allowance it spends does not exist yet, so it would be
+refused — and estimating some legs and not others would make the "Gas limit" line the
+approver reads mean two different things on one screen. Unused gas is refunded, so a generous
+constant (80 k wrap / 100 k allowance / 900 k shield) costs the user nothing beyond having
+the balance to cover it; a low estimate costs them a mined revert.
+
+**The wrap is a `deposit()` on the asset the caller named**, not on a chain's "wrapped base
+token" looked up by the wallet. A signing surface that substituted a different contract for
+the one a user typed would be the worst kind of help.
+
+**A mined revert is named as one.** A receipt with `status: 0x0` fails that leg and stops the
+route: the gas is spent, the state did not change, and nothing after it will execute either
+because the nonces are consecutive.
+
+**Where the signing path comes from, and it is not a new module.** `keystore_module` — already
+here for the account list — takes an intent through `request_approval`; `railgun_module`'s own
+`relayed_send` uses the same door for its UserOperation digests. The wallet holds no key and
+takes no password at any point.
+
+- **Returns:** `{"ok":true,"pending":true}`, or `{"ok":false,"error":…}` for a bad field or a
+  shield already running.
+- **Publishes:** `privateShieldJson` at every leg boundary, with each leg's transaction
+  `hashes` attached to the leg that produced them.
+
+##### `QString cancelPrivateShield()`
+
+**A harder line than the send's**, because three transactions signed with consecutive nonces
+are handed over back to back — the moment the first leaves, the route is the chain's.
+
+| cancelled during | what happens | what is left |
+|---|---|---|
+| `plan` | the flag is set and the reply in flight finds it; nothing was asked of a human | nothing signed, nothing on chain |
+| `sign`, before approval | `keystore_module.cancel_approval(handle, receipt)` takes the request out of the Signer's queue | nothing signed, nothing on chain |
+| `sign`, approved but not yet collected | the signatures are never fetched and `ack_result` tells the keystore to wipe its copy | nothing broadcast |
+| `wrap` / `approve` / `shield` | **refused** | the transactions are nonce-ordered in a mempool and cannot be recalled |
+
+`cancellable` on `privateShieldJson` goes false as the **first** `send_raw_transaction` is
+issued, not when its reply lands: a flag set on the reply would leave a window where a cancel
+answered "stopped" for something already in a mempool.
+
+A withdrawal that is itself refused still leaves the shield `cancelled` — the keystore sweeps
+an abandoned request after a minute, so the outcome for the user is the same.
+
 ##### Should the sync run in the background before a send? (logos-workspace#235, clause 4)
 
 **The distance is read automatically; the walk is started by the thing that needs it.**
@@ -775,7 +850,7 @@ The tab index ↔ page mapping (used by the `selectTab(i)` helper) is:
 | 4 | **History** | "Recent activity"; "Refresh history" button; `historyEmpty` "No transactions yet" placeholder; per-tx rows (kind · status · hash), colored by status | `historyJson` | `refreshHistory(acct)`, plus event-driven refills via `tx_status_changed` |
 | 5 | **Settings** | proxy URL field (`placeholderText: socks5h://127.0.0.1:9050`), "Require proxy (fail-closed)" checkbox, **Apply proxy** | — | `setProxyConfig` |
 | 6 | **Advanced** | chain id / name / RPC URL / symbol / optional Multicall3 fields, **Test endpoint**, **Save chain**; "Configured networks" list; seed phrase + account label + passphrase, **Import** | `chainsJson` | `testEndpoint`, `setChains`, `importMnemonic` |
-| 7 | **Private** | *the walk:* "Private balance"; `privateSyncLeg` / `privateSyncState` labels, `privateSyncProgress` bar, `privateSyncProgressText` (`% · blocks to go · about N s left`), `privateSyncNote` / `privateSyncError`; **Check** / **Sync now** / **Cancel**. *the send:* "Send privately"; `privateSendToField` / `privateSendAssetField` / `privateSendAmountField` / `privateSendMemoField` / `privateSendBundlerField`, `privateSendState`, the `privateSendLegs` route (one row per leg), `privateSendNote` / `privateSendError`; **Send privately** / **Cancel send** | `privateSyncJson`, `privateSendJson` | `refreshPrivateSync`, `startPrivateSync`, `cancelPrivateSync`, `startPrivateSend`, `cancelPrivateSend` |
+| 7 | **Private** | *the walk:* "Private balance"; `privateSyncLeg` / `privateSyncState` labels, `privateSyncProgress` bar, `privateSyncProgressText` (`% · blocks to go · about N s left`), `privateSyncNote` / `privateSyncError`; **Check** / **Sync now** / **Cancel**. *the shield:* "Shield into the pool"; `privateShieldAssetField` / `privateShieldAmountField` / `privateShieldWrapBox`, `privateShieldState`, the `privateShieldLegs` route (one row per leg, with the hashes it produced), `privateShieldNote` / `privateShieldError`; **Shield** / **Cancel shield**. *the send:* "Send privately"; `privateSendToField` / `privateSendAssetField` / `privateSendAmountField` / `privateSendMemoField` / `privateSendBundlerField`, `privateSendState`, the `privateSendLegs` route (one row per leg), `privateSendNote` / `privateSendError`; **Send privately** / **Cancel send** | `privateSyncJson`, `privateSendJson`, `privateShieldJson` | `refreshPrivateSync`, `startPrivateSync`, `cancelPrivateSync`, `startPrivateSend`, `cancelPrivateSend`, `startPrivateShield`, `cancelPrivateShield` |
 
 **Private is index 7 — appended, not placed next to Send.** The doc-tests and this table drive
 the bar by index (`call_method → selectTab(i)`), so a tab inserted in the middle renumbers
@@ -902,6 +977,23 @@ settles):
 { "ok": true, "state": "awaiting_approval" }
 { "ok": true, "state": "declined", "reason": "<why>" }
 { "ok": true, "state": "done", "hash": "0x…" }
+```
+
+**`startPrivateShield`** input (QML-built from the Private tab's shield form):
+```json
+{ "chainId": 11155111, "owner": "0x…", "asset": "0x…", "amount": "1000000000000000",
+  "wrap": true }
+```
+
+**`privateShieldJson`** while the route is running (one leg per row, hashes attached to the
+leg that produced them):
+```json
+{ "shield": { "state": "running", "leg": "approve", "cancellable": false,
+  "legs": [ { "name": "plan", "state": "done" },
+            { "name": "sign", "state": "done" },
+            { "name": "wrap", "state": "done", "hashes": ["0x…"] },
+            { "name": "approve", "state": "running", "hashes": ["0x…"] },
+            { "name": "shield", "state": "pending" } ] } }
 ```
 
 **Proxy config** (`setProxyConfig` input, QML-built):

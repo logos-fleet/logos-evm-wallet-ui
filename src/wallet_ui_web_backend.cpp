@@ -5,6 +5,8 @@
 #include <QJsonValue>
 #include <QStringList>
 
+#include <initializer_list>
+
 // The only way out of a wasm image. See wallet_ui_web_backend.h for why this
 // backend exists at all, and logos_web_module_call.h for what the door is.
 #include "logos_web_module_call.h"
@@ -223,6 +225,46 @@ QString refusalReason(const logos::web::ModuleCallResult& res, const QJsonObject
     return res.ok ? errorOf(reply) : res.error;
 }
 
+// "railgun_module refused relayed_send: …" — the one sentence a refusal is said
+// in, written once so every caller names the module it asked and the method it
+// asked for, in the same order and with the same punctuation.
+QString moduleRefused(const QString& module, const QString& method,
+                      const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return QStringLiteral("%1 refused %2: %3").arg(module, method, refusalReason(res, reply));
+}
+
+// A ROUTE LAID OUT FRESH: every leg named, in the order it is walked, and all of
+// them `pending`. The send's route and the shield's are the same shape — a
+// named leg with a state each — so they are laid out and moved by the same two
+// helpers rather than by two copies of them.
+QJsonArray pendingRoute(std::initializer_list<QString> legs)
+{
+    QJsonArray route;
+    for (const QString& leg : legs)
+        route.append(QJsonObject{ { QStringLiteral("name"), leg },
+                                  { QStringLiteral("state"), kStatePending } });
+    return route;
+}
+
+// ...and moving one leg of it, along with the line that names what is RUNNING.
+// `running` is only moved by a leg that STARTS: a leg that ends leaves it where
+// it was, which is what lets a failed or cancelled route still say which leg it
+// was on.
+void markLeg(QJsonArray& route, QString& running, const QString& leg, const QString& state)
+{
+    for (int i = 0; i < route.size(); ++i) {
+        QJsonObject entry = route.at(i).toObject();
+        if (entry.value(QStringLiteral("name")).toString() != leg)
+            continue;
+        entry.insert(QStringLiteral("state"), state);
+        route.replace(i, entry);
+        break;
+    }
+    if (state == kStateRunning)
+        running = leg;
+}
+
 // ...AND THE SAME, ON THE PAGE'S CONSOLE, for the keystore — whose callers
 // differ only in what they say afterwards, so the line itself is written here.
 QString announceKeystoreRefusal(const QString& method, const logos::web::ModuleCallResult& res,
@@ -251,6 +293,12 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     // ...and the same for the send: the route it would take, with nothing run.
     resetSendRoute();
     publishPrivateSend(kStateIdle, QStringLiteral("No private send has been started."));
+    // ...and for the shield, which is the route in the other direction. Both
+    // are published BEFORE anything can run, because the thing #235 is about is
+    // a user who cannot tell a working app from a hung one: a page that names
+    // its route from the first paint has already answered half of that.
+    resetShieldRoute();
+    publishPrivateShield(kStateIdle, QStringLiteral("No shield has been started."));
 
     // AUTOMATIC, AND ONLY AT THE EDGES. The view already picks the first
     // account as soon as one exists (WalletView.qml's `onCountChanged`), and it
@@ -1453,21 +1501,20 @@ QString WalletUiWebBackend::privateSyncUnavailable(const QString& method,
 // meaning is stated per leg rather than implied.
 //
 // WHY `relayed_send` AND NOT `prepare_transfer`. `prepare_transfer` hands back
-// an unsigned `transact(...)` for the caller to sign and broadcast, and this
-// variant has no signing or broadcasting of its own — the coordinator owns
-// sends and has no mobile build, which is why `sendNative` here refuses by
-// name. `relayed_send` is the whole send inside the module: it builds the 7702
+// an unsigned `transact(...)` for the caller to sign, broadcast and PAY FOR —
+// out of the very public account the private send exists to keep out of it.
+// `relayed_send` is the whole send inside the module: it builds the 7702
 // UserOperation, proves it, puts the digests in front of a human through
 // `keystore_module`, and submits the approved operation to the bundler through
 // `eth_rpc_module`. So the wallet drives a send with two methods and a poll,
 // and every leg boundary is a reply that landed rather than a guess.
 //
-// WHAT IS STILL NOT HERE, said plainly rather than faked: a SHIELD (public →
-// private). `prepare_shield` answers with public transactions for the caller to
-// approve and send, which needs exactly the signing path this variant does not
-// have — so `wrap` / `approve` / `shield`, the three legs that put funds INTO
-// the pool, belong to a build that can sign. The route below is the send of
-// funds that are already shielded, and it names its own four legs and no others.
+// FOUR LEGS AND NOT SIX. `wrap` / `approve` / `shield` put funds INTO the pool
+// and are a separate operation with a separate surface — see "the shield" at
+// the bottom of this file, which is where the signing path lives. The route
+// below is the send of funds that are ALREADY shielded, and it names its own
+// four legs and no others: a route showing three permanently-skipped legs
+// would be describing something this wallet never does in one go.
 namespace {
 
 // HOW OFTEN A PARKED APPROVAL IS ASKED ABOUT. A human in another app is the
@@ -1489,14 +1536,6 @@ const QString kCancelledBeforeSigning = QStringLiteral(
 const QString kAlreadyBroadcast = QStringLiteral(
     "This private send has already been broadcast: the operation is the chain's now and "
     "cannot be recalled.");
-
-// "railgun_module refused relayed_send: …" — the one sentence a refusal on this
-// route is said in, written once so every leg names the method it asked for.
-QString railgunRefused(const QString& method, const logos::web::ModuleCallResult& res,
-                       const QJsonObject& reply)
-{
-    return QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, refusalReason(res, reply));
-}
 
 // What a send needs before this variant will spend a round trip on it, in the
 // order a user fills them in. Same rule the custom-token field follows: what
@@ -1527,27 +1566,12 @@ QString missingSendField(const QJsonObject& p)
 void WalletUiWebBackend::resetSendRoute()
 {
     m_sendLeg.clear();
-    m_sendLegs = QJsonArray{};
-    for (const QString& leg : { kLegSync, kLegProve, kLegApprove, kLegBroadcast })
-        m_sendLegs.append(QJsonObject{ { QStringLiteral("name"), leg },
-                                       { QStringLiteral("state"), kStatePending } });
+    m_sendLegs = pendingRoute({ kLegSync, kLegProve, kLegApprove, kLegBroadcast });
 }
 
 void WalletUiWebBackend::setSendLeg(const QString& leg, const QString& state)
 {
-    for (int i = 0; i < m_sendLegs.size(); ++i) {
-        QJsonObject entry = m_sendLegs.at(i).toObject();
-        if (entry.value(QStringLiteral("name")).toString() != leg)
-            continue;
-        entry.insert(QStringLiteral("state"), state);
-        m_sendLegs.replace(i, entry);
-        break;
-    }
-    // `leg` names what is RUNNING, so it is only moved by a leg that starts.
-    // A leg that ends leaves it where it was, which is what lets a failed or
-    // cancelled send still say which leg it was on.
-    if (state == kStateRunning)
-        m_sendLeg = leg;
+    markLeg(m_sendLegs, m_sendLeg, leg, state);
 }
 
 QString WalletUiWebBackend::sendLegState(const QString& leg) const
@@ -1656,7 +1680,7 @@ void WalletUiWebBackend::beginSendProve()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failSendLeg(kLegProve,
-                            railgunRefused(QStringLiteral("relayed_send"), res, reply));
+                            moduleRefused(kRailgun, QStringLiteral("relayed_send"), res, reply));
                 return;
             }
             m_sendRequestId = reply.value(QStringLiteral("requestId")).toString();
@@ -1690,7 +1714,8 @@ void WalletUiWebBackend::pollSendApproval()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failSendLeg(kLegApprove,
-                            railgunRefused(QStringLiteral("relayed_send_status"), res, reply));
+                            moduleRefused(kRailgun, QStringLiteral("relayed_send_status"),
+                                          res, reply));
                 return;
             }
             const QString state = reply.value(QStringLiteral("state")).toString();
@@ -1761,7 +1786,7 @@ void WalletUiWebBackend::withdrawSendRequest()
                 // sweeps on its own — so the outcome for the user is the same
                 // and the difference is said rather than hidden.
                 const QString why =
-                    railgunRefused(QStringLiteral("relayed_send_cancel"), res, reply);
+                    moduleRefused(kRailgun, QStringLiteral("relayed_send_cancel"), res, reply);
                 announce(why);
                 finishSend(kStateCancelled, kCancelledBeforeSigning, why);
                 return;
@@ -1836,4 +1861,807 @@ void WalletUiWebBackend::finishSend(const QString& state, const QString& note,
 {
     m_sendRunning = false;
     publishPrivateSend(state, note, error);
+}
+
+// ── the shield: public funds going INTO the pool ─────────────────────────────
+//
+// THE OTHER HALF OF #235 CLAUSE 1. The route above spends a balance that is
+// already shielded and names four legs; the clause names six, and the three it
+// was missing — `wrap`, `approve`, `shield` — are these. They were missing for
+// a reason: every one of them is a PUBLIC transaction that has to be signed by
+// the user's EOA and broadcast, and this variant had no signing path.
+//
+// IT HAS ONE, AND IT IS NOT A NEW MODULE. `keystore_module` — already here for
+// the account list — takes an INTENT through `request_approval`: an address, a
+// purpose, and legs to sign. `relayed_send` inside `railgun_module` uses the
+// same door for the digests of its UserOperation, so this is the established
+// way a module gets a signature out of this keystore, and the wallet holds no
+// key and takes no password at any point.
+//
+// ONE BUNDLE, ONE HUMAN ANSWER. The keystore signs an intent's legs IN ORDER
+// UNDER A SINGLE KEY DERIVATION, so the wrap, the allowance and the shield are
+// rendered to the approver together and cost one password entry. They are
+// signed with CONSECUTIVE NONCES, which is what lets all three be broadcast
+// back to back: the chain will not execute the shield before the allowance,
+// whatever order they reach a mempool in. That is the difference between a
+// route that takes three block times and one that takes one.
+//
+// WHERE THE CANCEL LINE IS. Up to the moment the first raw transaction is
+// handed to eth_rpc there is nothing on chain: the approval request is
+// withdrawn from the Signer's queue and the signatures — if they were already
+// collected — are dropped and wiped. After it, the transactions are the
+// chain's, they are nonce-ordered and they will be mined, so a cancel is
+// REFUSED. That line is harder than the send's, and it is stated rather than
+// discovered.
+namespace {
+
+// THE ROUTE, in the order it is walked. `plan` and `sign` are not in #235's
+// list of legs and are named anyway: they are where a user waits for a reason
+// that is not the chain's, and a surface whose whole point is "the app has not
+// hung" cannot have unnamed waits in it.
+const QString kLegPlan = QStringLiteral("plan");
+const QString kLegSign = QStringLiteral("sign");
+const QString kLegWrap = QStringLiteral("wrap");
+const QString kLegAllow = QStringLiteral("approve");
+const QString kLegShield = QStringLiteral("shield");
+
+// WETH9's payable `deposit()`. The one selector this wallet spells out, because
+// it is the one call in the route no module builds for it: `prepare_shield`
+// answers the shield, `approve(spender,value)` is the ERC-20 standard, and this
+// is how native ETH becomes the ERC-20 RAILGUN takes. The asset the caller
+// named IS the wrapper — the wallet does not go looking for a chain's
+// "wrapped base token", because guessing which contract a user meant is exactly
+// the kind of help a signing surface must not offer.
+const QString kDepositSelector = QStringLiteral("0xd0e30db0");
+// `approve(address,uint256)`.
+const QString kApproveSelector = QStringLiteral("0x095ea7b3");
+
+// GAS LIMITS THIS WALLET STATES RATHER THAN ESTIMATES, and the reason is the
+// route's own shape: `eth_estimateGas` for the SHIELD would be asked against a
+// chain state where the allowance it spends does not exist yet, so it would be
+// refused — and estimating some legs and not others would make the "Gas limit"
+// line the approver reads mean two different things on one screen. Unused gas
+// is refunded, so a generous constant costs the user nothing beyond having the
+// balance to cover it; a low estimate costs them a mined revert.
+constexpr int kWrapGas = 80000;     // WETH9 deposit() is ~45k
+constexpr int kApproveGas = 100000; // an ERC-20 approve is ~46k
+constexpr int kShieldGas = 900000;  // RailgunSmartWallet shield, one note
+
+// A tip a chain's floor is usually happy with, and a ceiling with room for the
+// base fee to double before the bundle lands. The same shape `live_send.rs`
+// uses for the probe's own transactions — a wallet pays the base fee of the
+// block it lands in, not this ceiling.
+constexpr quint64 kPriorityFeeWei = 1000000000ull; // 1 gwei
+
+// How often a parked approval and a pending receipt are asked about. Different
+// numbers because they wait for different things: a human in another app
+// answers in seconds, and a block is twelve.
+constexpr int kShieldApprovalPollMs = 1000;
+constexpr int kShieldReceiptPollMs = 3000;
+
+// eth_rpc answers its quantities as `0x…`; this is the one place they become
+// numbers. A nonce and a gas price both fit in 64 bits by construction (a
+// nonce is a count and a gas price is wei-per-gas), which is why this is not
+// the 256-bit path below.
+quint64 quantity(const QJsonValue& v, bool* ok)
+{
+    QString hex = v.toString().trimmed();
+    if (hex.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive))
+        hex = hex.mid(2);
+    if (hex.isEmpty()) {
+        *ok = false;
+        return 0;
+    }
+    return hex.toULongLong(ok, 16);
+}
+
+QString hexQuantity(quint64 v)
+{
+    return QStringLiteral("0x%1").arg(v, 0, 16);
+}
+
+// A decimal amount in an asset's base units → the 32-byte big-endian hex an
+// ERC-20 argument is encoded as. DONE BY HAND rather than through a 64-bit
+// integer: an 18-decimal token passes 2^64 at 18.45 whole units, so anything
+// that went via `toULongLong` would refuse — or, worse, truncate — an ordinary
+// amount. Answers empty for anything that is not a decimal integer under
+// 2^256, which is the only way this can fail.
+QString abiUint256(const QString& decimal)
+{
+    const QString s = decimal.trimmed();
+    if (s.isEmpty())
+        return QString();
+    quint8 be[32] = { 0 };
+    for (const QChar& ch : s) {
+        if (ch < QLatin1Char('0') || ch > QLatin1Char('9'))
+            return QString();
+        int carry = ch.unicode() - '0';
+        for (int i = 31; i >= 0; --i) {
+            const int v = int(be[i]) * 10 + carry;
+            be[i] = quint8(v & 0xff);
+            carry = v >> 8;
+        }
+        if (carry != 0)
+            return QString(); // more than 2^256 - 1
+    }
+    QString out;
+    for (quint8 b : be)
+        out += QStringLiteral("%1").arg(b, 2, 16, QLatin1Char('0'));
+    return out;
+}
+
+// An address as a 32-byte ABI word. Answers empty for anything that is not 20
+// hex bytes, which is what makes a mistyped spender a refusal here rather than
+// an allowance granted to nobody.
+QString abiAddress(const QString& address)
+{
+    QString hex = address.trimmed();
+    if (hex.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive))
+        hex = hex.mid(2);
+    if (hex.size() != 40)
+        return QString();
+    for (const QChar& ch : hex) {
+        if (!((ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
+              || (ch.toLower() >= QLatin1Char('a') && ch.toLower() <= QLatin1Char('f'))))
+            return QString();
+    }
+    return QString(24, QLatin1Char('0')) + hex.toLower();
+}
+
+// What a shield needs before this variant will spend a round trip on it, in the
+// order a user fills them in — the same rule `missingSendField` follows: what
+// the wallet can see is wrong it says HERE, and never as a refusal that names a
+// module as though the module were the problem.
+QString missingShieldField(const QJsonObject& p)
+{
+    if (p.value(QStringLiteral("chainId")).toInt() <= 0)
+        return QStringLiteral("A shield needs the chain it happens on (`chainId`).");
+    if (p.value(QStringLiteral("owner")).toString().trimmed().isEmpty())
+        return QStringLiteral("A shield needs the account that signs and pays for it "
+                              "(`owner`) — the EOA the public transactions come from.");
+    if (p.value(QStringLiteral("asset")).toString().trimmed().isEmpty())
+        return QStringLiteral("A shield needs the asset (`asset`) — the ERC-20 address being "
+                              "deposited into the shielded pool.");
+    if (abiUint256(p.value(QStringLiteral("amount")).toString()).isEmpty())
+        return QStringLiteral("A shield needs an amount (`amount`) in the asset's own base "
+                              "units, written as a decimal whole number.");
+    return QString();
+}
+
+// WHAT LEAVING COSTS, before anything has been handed to the chain.
+const QString kShieldCancelledBeforeChain = QStringLiteral(
+    "Stopped before any transaction reached the chain — the approval request was withdrawn "
+    "from the Signer app and the signatures were discarded. Nothing was spent, no allowance "
+    "was granted and nothing was shielded.");
+
+// ...and the one point where there is nothing to stop. Harder than the send's,
+// because three transactions are already nonce-ordered in a mempool.
+const QString kShieldAlreadyOnChain = QStringLiteral(
+    "These transactions have already been broadcast: they are the chain's now, they are "
+    "ordered by nonce and they cannot be recalled.");
+
+} // namespace
+
+void WalletUiWebBackend::resetShieldRoute()
+{
+    m_shieldLeg.clear();
+    m_shieldLegs = pendingRoute({ kLegPlan, kLegSign, kLegWrap, kLegAllow, kLegShield });
+}
+
+void WalletUiWebBackend::setShieldLeg(const QString& leg, const QString& state)
+{
+    markLeg(m_shieldLegs, m_shieldLeg, leg, state);
+}
+
+QString WalletUiWebBackend::startPrivateShield(QString shieldJson)
+{
+    if (m_shieldRunning)
+        return failed(QStringLiteral("A shield is already running"));
+
+    const QJsonObject params = QJsonDocument::fromJson(shieldJson.toUtf8()).object();
+    const QString missing = missingShieldField(params);
+    if (!missing.isEmpty()) {
+        // ON THE SURFACE AND NOT ONLY ON THE STATUS LINE. Measured on an iPad
+        // Air 13-inch simulator: a device with no account in its keystore
+        // pressed `Shield`, the form had no `owner`, and `privateShieldJson`
+        // was never published at all — so the one panel the user was looking at
+        // said nothing while the route had already been refused
+        // (logos-workspace#235).
+        setStatusText(missing);
+        // The route is laid out fresh rather than left as the last run's: the
+        // refusal is about the shield the user is trying to start NOW, and an
+        // `idle` state over a route still showing `done` legs reads as neither.
+        m_shieldTxs = QJsonArray{};
+        resetShieldRoute();
+        publishPrivateShield(kStateIdle, QString(), missing);
+        return failed(missing);
+    }
+
+    m_shieldParams = QJsonObject{
+        { QStringLiteral("chainId"), params.value(QStringLiteral("chainId")).toInt() },
+        { QStringLiteral("owner"), params.value(QStringLiteral("owner")).toString().trimmed() },
+        { QStringLiteral("asset"), params.value(QStringLiteral("asset")).toString().trimmed() },
+        { QStringLiteral("amount"), params.value(QStringLiteral("amount")).toString().trimmed() },
+        { QStringLiteral("wrap"), params.value(QStringLiteral("wrap")).toBool() },
+    };
+    m_shieldTxs = QJsonArray{};
+    m_shieldSigned.clear();
+    m_shieldHandle.clear();
+    m_shieldReceipt.clear();
+    m_shieldSent = 0;
+    m_shieldMined = 0;
+    m_shieldCancelled = false;
+    m_shieldBroadcast = false;
+    m_shieldRunning = true;
+    resetShieldRoute();
+
+    setShieldLeg(kLegPlan, kStateRunning);
+    setStatusText(QStringLiteral("Preparing the shield…"));
+    publishPrivateShield(kStateRunning);
+
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    // CONFIGURE, THEN ASK — the rule every eth_rpc read in this file follows,
+    // and the one a device run found the hard way: a nonce asked of an
+    // unconfigured chain comes back "no configuration for chain N".
+    ensureChainConfig(
+        chainId, chainById(chainId).value(QStringLiteral("rpcUrl")).toString(), [this]() {
+            QJsonObject ask;
+            ask.insert(QStringLiteral("asset"),
+                       m_shieldParams.value(QStringLiteral("asset")).toString());
+            ask.insert(QStringLiteral("amount"),
+                       m_shieldParams.value(QStringLiteral("amount")).toString());
+            logos::web::callModuleAsync(
+                kRailgun, QStringLiteral("prepare_shield"), QJsonArray{ jsonText(ask) },
+                [this](const logos::web::ModuleCallResult& res) {
+                    const QJsonObject reply = replyOf(res);
+                    if (!callSucceeded(res, reply)) {
+                        failShieldLeg(kLegPlan,
+                                      moduleRefused(kRailgun, QStringLiteral("prepare_shield"),
+                                                    res, reply));
+                        return;
+                    }
+                    const QJsonArray txs = reply.value(QStringLiteral("txs")).toArray();
+                    if (txs.isEmpty()) {
+                        failShieldLeg(kLegPlan,
+                                      QStringLiteral("%1 answered no transactions to shield")
+                                          .arg(kRailgun));
+                        return;
+                    }
+                    // Kept as the module wrote them. The `to` of the first is
+                    // the RailgunSmartWallet, and is what the allowance names
+                    // as its spender — read off the reply so a redeployed
+                    // contract does not need this wallet rebuilt.
+                    for (const QJsonValue& v : txs) {
+                        QJsonObject tx = v.toObject();
+                        tx.insert(QStringLiteral("leg"), kLegShield);
+                        m_shieldTxs.append(tx);
+                    }
+                    shieldReadNonce();
+                });
+        });
+    return accepted();
+}
+
+void WalletUiWebBackend::shieldReadNonce()
+{
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    logos::web::callModuleAsync(
+        kEthRpc, QStringLiteral("get_transaction_count"),
+        QJsonArray{ chainId, m_shieldParams.value(QStringLiteral("owner")).toString() },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(kLegPlan,
+                              moduleRefused(kEthRpc, QStringLiteral("get_transaction_count"),
+                                            res, reply));
+                return;
+            }
+            bool ok = false;
+            m_shieldNonce = quantity(resultOf(reply), &ok);
+            if (!ok) {
+                failShieldLeg(kLegPlan,
+                              QStringLiteral("%1 answered a nonce this wallet cannot read: %2")
+                                  .arg(kEthRpc, resultOf(reply).toString()));
+                return;
+            }
+            shieldReadGasPrice();
+        });
+}
+
+void WalletUiWebBackend::shieldReadGasPrice()
+{
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    logos::web::callModuleAsync(
+        kEthRpc, QStringLiteral("gas_price"), QJsonArray{ chainId },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(kLegPlan,
+                              moduleRefused(kEthRpc, QStringLiteral("gas_price"), res, reply));
+                return;
+            }
+            bool ok = false;
+            const quint64 gasPrice = quantity(resultOf(reply), &ok);
+            if (!ok) {
+                failShieldLeg(kLegPlan,
+                              QStringLiteral("%1 answered a gas price this wallet cannot read: %2")
+                                  .arg(kEthRpc, resultOf(reply).toString()));
+                return;
+            }
+            m_shieldTip = kPriorityFeeWei;
+            m_shieldMaxFee = gasPrice * 2 + m_shieldTip;
+
+            const QString wrong = buildShieldTxs();
+            if (!wrong.isEmpty()) {
+                failShieldLeg(kLegPlan, wrong);
+                return;
+            }
+            setShieldLeg(kLegPlan, kStateDone);
+            // THE USER LEFT WHILE THE PLAN WAS BEING READ. Nothing has been
+            // asked of a human and nothing signed, so there is nothing to
+            // withdraw — the route simply stops before it costs anyone a
+            // decision.
+            if (m_shieldCancelled) {
+                setShieldLeg(kLegSign, kStateCancelled);
+                setStatusText(QStringLiteral("Shield cancelled"));
+                finishShield(kStateCancelled, kShieldCancelledBeforeChain);
+                return;
+            }
+            requestShieldApproval();
+        });
+}
+
+// LAY THE ROUTE OUT AS TRANSACTIONS, in the order the chain must execute them:
+// the wrap mints the ERC-20, the allowance lets the RailgunSmartWallet take it,
+// and the shield takes it. The nonces are consecutive from the account's
+// current one, which is what makes that order a fact rather than a hope.
+QString WalletUiWebBackend::buildShieldTxs()
+{
+    const QString asset = m_shieldParams.value(QStringLiteral("asset")).toString();
+    const QString amount = m_shieldParams.value(QStringLiteral("amount")).toString();
+    const QString spender =
+        m_shieldTxs.isEmpty() ? QString()
+                              : m_shieldTxs.at(0).toObject().value(QStringLiteral("to")).toString();
+
+    const QString spenderWord = abiAddress(spender);
+    if (spenderWord.isEmpty())
+        return QStringLiteral("%1 answered a shield addressed to `%2`, which is not an address "
+                              "this wallet can grant an allowance to.")
+            .arg(kRailgun, spender);
+    const QString amountWord = abiUint256(amount);
+    if (amountWord.isEmpty())
+        return QStringLiteral("`%1` is not an amount in base units this wallet can encode.")
+            .arg(amount);
+
+    QJsonArray route;
+    if (m_shieldParams.value(QStringLiteral("wrap")).toBool()) {
+        // `deposit()` ON THE ASSET ITSELF, paid with the amount being shielded.
+        // The wallet does not look up a chain's wrapped base token: the caller
+        // named the asset, and a signing surface that substituted a different
+        // contract for the one a user typed would be the worst kind of help.
+        route.append(QJsonObject{ { QStringLiteral("leg"), kLegWrap },
+                                  { QStringLiteral("to"), asset },
+                                  { QStringLiteral("data"), kDepositSelector },
+                                  { QStringLiteral("value"), amount },
+                                  { QStringLiteral("gasLimit"), kWrapGas } });
+    } else {
+        // NOT `pending`: a leg that was not needed and a leg that ran are
+        // different claims, and only one of them is work this wallet did.
+        setShieldLeg(kLegWrap, kStateSkipped);
+    }
+    route.append(QJsonObject{ { QStringLiteral("leg"), kLegAllow },
+                              { QStringLiteral("to"), asset },
+                              { QStringLiteral("data"),
+                                kApproveSelector + spenderWord + amountWord },
+                              { QStringLiteral("value"), QStringLiteral("0") },
+                              { QStringLiteral("gasLimit"), kApproveGas } });
+    for (const QJsonValue& v : m_shieldTxs) {
+        QJsonObject tx = v.toObject();
+        tx.insert(QStringLiteral("gasLimit"), kShieldGas);
+        route.append(tx);
+    }
+
+    quint64 nonce = m_shieldNonce;
+    for (int i = 0; i < route.size(); ++i) {
+        QJsonObject tx = route.at(i).toObject();
+        tx.insert(QStringLiteral("nonce"), hexQuantity(nonce++));
+        route.replace(i, tx);
+    }
+    m_shieldTxs = route;
+    return QString();
+}
+
+// LEG 2 — the human, asked ONCE for the whole route. The keystore renders every
+// leg it is given, so the approver sees the wrap, the allowance and the shield
+// on one screen with their selectors and their full calldata, and answers with
+// one password. This wallet never sees the key or the password.
+void WalletUiWebBackend::requestShieldApproval()
+{
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    QJsonArray legs;
+    for (const QJsonValue& v : m_shieldTxs) {
+        const QJsonObject tx = v.toObject();
+        QJsonObject unsignedTx;
+        unsignedTx.insert(QStringLiteral("to"), tx.value(QStringLiteral("to")).toString());
+        unsignedTx.insert(QStringLiteral("value"), tx.value(QStringLiteral("value")).toString());
+        unsignedTx.insert(QStringLiteral("nonce"), tx.value(QStringLiteral("nonce")).toString());
+        unsignedTx.insert(QStringLiteral("gas_limit"),
+                          hexQuantity(quint64(tx.value(QStringLiteral("gasLimit")).toInt())));
+        unsignedTx.insert(QStringLiteral("data"), tx.value(QStringLiteral("data")).toString());
+        unsignedTx.insert(QStringLiteral("fee_mode"), QStringLiteral("eip1559"));
+        unsignedTx.insert(QStringLiteral("max_fee_per_gas"), hexQuantity(m_shieldMaxFee));
+        unsignedTx.insert(QStringLiteral("max_priority_fee_per_gas"), hexQuantity(m_shieldTip));
+        legs.append(QJsonObject{ { QStringLiteral("kind"), QStringLiteral("tx") },
+                                 { QStringLiteral("chain_id"), chainId },
+                                 { QStringLiteral("tx"), unsignedTx } });
+    }
+
+    QJsonObject intent;
+    intent.insert(QStringLiteral("address"),
+                  m_shieldParams.value(QStringLiteral("owner")).toString());
+    // A CLAIM AND THE KEYSTORE SAYS SO. The approver shows this under "claimed
+    // by the requester" and shows the transactions separately, which is why it
+    // can be plain and useful rather than careful: what is actually signed is
+    // rendered from the legs and not from this line.
+    intent.insert(QStringLiteral("purpose"),
+                  QStringLiteral("Shield %1 of %2 into the RAILGUN pool")
+                      .arg(m_shieldParams.value(QStringLiteral("amount")).toString(),
+                           m_shieldParams.value(QStringLiteral("asset")).toString()));
+    intent.insert(QStringLiteral("legs"), legs);
+
+    setShieldLeg(kLegSign, kStateRunning);
+    setStatusText(QStringLiteral("Waiting for approval in the Signer app"));
+    publishPrivateShield(kStateRunning);
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("request_approval"), QJsonArray{ jsonText(intent) },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(kLegSign,
+                              moduleRefused(kKeystore, QStringLiteral("request_approval"),
+                                            res, reply));
+                return;
+            }
+            m_shieldHandle = reply.value(QStringLiteral("handle")).toString();
+            m_shieldReceipt = reply.value(QStringLiteral("receipt")).toString();
+            if (m_shieldHandle.isEmpty() || m_shieldReceipt.isEmpty()) {
+                failShieldLeg(kLegSign,
+                              QStringLiteral("%1 took the request but answered no handle to "
+                                             "collect it with")
+                                  .arg(kKeystore));
+                return;
+            }
+            // THE USER LEFT WHILE THE REQUEST WAS BEING LODGED. There was
+            // nothing to withdraw until this reply landed, and now there is.
+            if (m_shieldCancelled) {
+                withdrawShieldRequest();
+                return;
+            }
+            pollShieldApproval();
+        });
+}
+
+void WalletUiWebBackend::pollShieldApproval()
+{
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("approval_status"),
+        QJsonArray{ m_shieldHandle, m_shieldReceipt },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(kLegSign,
+                              moduleRefused(kKeystore, QStringLiteral("approval_status"),
+                                            res, reply));
+                return;
+            }
+            const QString state = reply.value(QStringLiteral("state")).toString();
+            if (state == QStringLiteral("offered") || state == QStringLiteral("rendered")) {
+                if (m_shieldCancelled) {
+                    withdrawShieldRequest();
+                    return;
+                }
+                // ASKED AGAIN, ON A TIMER — the only place in this route where
+                // a call is not chained out of a reply, because what is being
+                // waited for is a person and there is no reply to chain out of
+                // until they answer.
+                QTimer::singleShot(kShieldApprovalPollMs, this, [this]() {
+                    if (m_shieldRunning && !m_shieldCancelled)
+                        pollShieldApproval();
+                });
+                return;
+            }
+            if (state != QStringLiteral("settled")) {
+                failShieldLeg(kLegSign,
+                              QStringLiteral("%1 answered an approval state this wallet does "
+                                             "not know: %2")
+                                  .arg(kKeystore, state));
+                return;
+            }
+            const QString reason = reply.value(QStringLiteral("reason")).toString();
+            if (reason != QStringLiteral("approved")) {
+                // NOT A FAILURE OF THE WALLET: a person said no, or the
+                // keystore swept a request nobody answered. Nothing was signed.
+                failShieldLeg(kLegSign,
+                              QStringLiteral("The Signer app did not approve this shield: %1")
+                                  .arg(reason.isEmpty() ? QStringLiteral("settled") : reason));
+                return;
+            }
+            if (m_shieldCancelled) {
+                // APPROVED, BUT THE USER HAS ALREADY LEFT. The request is
+                // settled so there is nothing to withdraw; the signatures are
+                // simply never collected, and the keystore is told to wipe the
+                // copy it is holding for a requester that is not coming.
+                setShieldLeg(kLegSign, kStateCancelled);
+                ackShieldSignatures();
+                return;
+            }
+            collectShieldSignatures();
+        });
+}
+
+void WalletUiWebBackend::collectShieldSignatures()
+{
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("fetch_result"), QJsonArray{ m_shieldHandle, m_shieldReceipt },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(kLegSign,
+                              moduleRefused(kKeystore, QStringLiteral("fetch_result"), res, reply));
+                return;
+            }
+            m_shieldSigned.clear();
+            for (const QJsonValue& v : reply.value(QStringLiteral("signed")).toArray())
+                m_shieldSigned.append(v.toString());
+            // ONE SIGNATURE PER TRANSACTION OR NONE OF THEM. A bundle that came
+            // back short would leave a route where the allowance is signed and
+            // the shield is not — which on chain is an allowance granted for
+            // nothing, and is worse than a refusal here.
+            if (m_shieldSigned.size() != m_shieldTxs.size()) {
+                failShieldLeg(kLegSign,
+                              QStringLiteral("%1 signed %2 of this route's %3 transactions")
+                                  .arg(kKeystore)
+                                  .arg(m_shieldSigned.size())
+                                  .arg(m_shieldTxs.size()));
+                return;
+            }
+            setShieldLeg(kLegSign, kStateDone);
+            if (m_shieldCancelled) {
+                // SIGNED AND NEVER SENT. This is the last moment a cancel costs
+                // nothing: the raw transactions are dropped here and the
+                // keystore is told to erase its copy.
+                m_shieldSigned.clear();
+                ackShieldSignatures();
+                return;
+            }
+            broadcastShieldTx();
+        });
+}
+
+// LEGS 3-5 — the chain, and all of them handed over before any of them is
+// followed. The nonces already order the execution, so waiting for a receipt
+// between them would cost the user a block time per leg and buy nothing.
+void WalletUiWebBackend::broadcastShieldTx()
+{
+    if (m_shieldSent >= m_shieldTxs.size()) {
+        ackShieldSignatures();
+        return;
+    }
+    const QJsonObject tx = m_shieldTxs.at(m_shieldSent).toObject();
+    const QString leg = tx.value(QStringLiteral("leg")).toString();
+    // THE POINT OF NO RETURN, marked BEFORE the call and not on its reply: once
+    // this has left, a cancel that answered "stopped" would be describing a
+    // transaction that is already in a mempool.
+    m_shieldBroadcast = true;
+    setShieldLeg(leg, kStateRunning);
+    setStatusText(QStringLiteral("Broadcasting the %1…").arg(leg));
+    publishPrivateShield(kStateRunning);
+
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    const int index = m_shieldSent;
+    logos::web::callModuleAsync(
+        kEthRpc, QStringLiteral("send_raw_transaction"),
+        QJsonArray{ chainId, m_shieldSigned.at(index) },
+        [this, index, leg](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(leg,
+                              moduleRefused(kEthRpc, QStringLiteral("send_raw_transaction"),
+                                            res, reply));
+                return;
+            }
+            QJsonObject tx = m_shieldTxs.at(index).toObject();
+            tx.insert(QStringLiteral("hash"), reply.value(QStringLiteral("hash")).toString());
+            m_shieldTxs.replace(index, tx);
+            ++m_shieldSent;
+            broadcastShieldTx();
+        });
+}
+
+void WalletUiWebBackend::ackShieldSignatures()
+{
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("ack_result"), QJsonArray{ m_shieldHandle, m_shieldReceipt },
+        [this](const logos::web::ModuleCallResult& res) {
+            // A BARE BOOL, and a best effort either way: the keystore sweeps a
+            // result nobody acknowledged on its own, so a refusal here changes
+            // nothing about what is on chain and is announced rather than shown.
+            announce(QStringLiteral("%1.ack_result -> %2")
+                         .arg(kKeystore,
+                              res.ok ? (res.value.toBool() ? QStringLiteral("erased")
+                                                           : QStringLiteral("refused"))
+                                     : res.error));
+            if (m_shieldCancelled && !m_shieldBroadcast) {
+                setStatusText(QStringLiteral("Shield cancelled"));
+                finishShield(kStateCancelled, kShieldCancelledBeforeChain);
+                return;
+            }
+            followShieldReceipt();
+        });
+}
+
+// ...AND THEN WAIT FOR BLOCKS, which is the one wait on this route whose length
+// the chain decides. A leg is `done` when the last of its transactions is
+// mined, so the surface moves as the chain does.
+void WalletUiWebBackend::followShieldReceipt()
+{
+    if (m_shieldMined >= m_shieldTxs.size()) {
+        QStringList hashes;
+        for (const QJsonValue& v : m_shieldTxs)
+            hashes.append(v.toObject().value(QStringLiteral("hash")).toString());
+        setStatusText(QStringLiteral("Shielded"));
+        finishShield(kStateDone,
+                     QStringLiteral("Mined: %1. The balance is in the shielded pool and the "
+                                    "next private sync will find it.")
+                         .arg(hashes.join(QStringLiteral(", "))));
+        return;
+    }
+    const int index = m_shieldMined;
+    const QJsonObject tx = m_shieldTxs.at(index).toObject();
+    const QString leg = tx.value(QStringLiteral("leg")).toString();
+    const QString hash = tx.value(QStringLiteral("hash")).toString();
+    const int chainId = m_shieldParams.value(QStringLiteral("chainId")).toInt();
+    logos::web::callModuleAsync(
+        kEthRpc, QStringLiteral("get_transaction_receipt"), QJsonArray{ chainId, hash },
+        [this, leg, hash](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                failShieldLeg(leg,
+                              moduleRefused(kEthRpc, QStringLiteral("get_transaction_receipt"),
+                                            res, reply));
+                return;
+            }
+            const QJsonValue result = resultOf(reply);
+            if (!result.isObject()) {
+                // NOT MINED YET. A null receipt is the ordinary answer for the
+                // twelve seconds a block takes, and is not an error to report.
+                QTimer::singleShot(kShieldReceiptPollMs, this, [this]() {
+                    if (m_shieldRunning)
+                        followShieldReceipt();
+                });
+                return;
+            }
+            const QString status = result.toObject().value(QStringLiteral("status")).toString();
+            if (status != QStringLiteral("0x1")) {
+                // A MINED REVERT. The gas is spent and the state did not
+                // change, and it is a different thing from a call that never
+                // went out — so it is said as what it is.
+                failShieldLeg(leg,
+                              QStringLiteral("The %1 transaction was mined but reverted (%2). "
+                                             "Its gas was spent; nothing after it will be "
+                                             "executed.")
+                                  .arg(leg, hash));
+                return;
+            }
+            ++m_shieldMined;
+            // The leg is done once the LAST of its transactions is mined —
+            // `prepare_shield` may answer more than one.
+            const bool moreOfThisLeg =
+                m_shieldMined < m_shieldTxs.size()
+                && m_shieldTxs.at(m_shieldMined).toObject().value(QStringLiteral("leg")).toString()
+                    == leg;
+            if (!moreOfThisLeg)
+                setShieldLeg(leg, kStateDone);
+            publishPrivateShield(kStateRunning);
+            followShieldReceipt();
+        });
+}
+
+void WalletUiWebBackend::withdrawShieldRequest()
+{
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("cancel_approval"),
+        QJsonArray{ m_shieldHandle, m_shieldReceipt },
+        [this](const logos::web::ModuleCallResult& res) {
+            // THE SHIELD IS CANCELLED EITHER WAY. A withdrawal that did not
+            // land leaves a request in the approver's queue, which the keystore
+            // sweeps on its own after a minute — so the outcome for the user is
+            // the same and the difference is announced rather than hidden.
+            announce(QStringLiteral("%1.cancel_approval -> %2")
+                         .arg(kKeystore,
+                              res.ok ? (res.value.toBool() ? QStringLiteral("withdrawn")
+                                                           : QStringLiteral("refused"))
+                                     : res.error));
+            setShieldLeg(kLegSign, kStateCancelled);
+            setStatusText(QStringLiteral("Shield cancelled"));
+            finishShield(kStateCancelled, kShieldCancelledBeforeChain);
+        });
+}
+
+QString WalletUiWebBackend::cancelPrivateShield()
+{
+    // Checked before "is anything running", for the same reason the send's is:
+    // the honest answer to cancelling something that has left is not "there is
+    // nothing here".
+    if (m_shieldBroadcast)
+        return failed(kShieldAlreadyOnChain);
+    if (!m_shieldRunning)
+        return failed(QStringLiteral("No shield is running"));
+
+    m_shieldCancelled = true;
+    if (!m_shieldHandle.isEmpty()) {
+        withdrawShieldRequest();
+        return accepted();
+    }
+    // The plan is still being read. Nothing has been asked of a human, so there
+    // is nothing to withdraw and the reply in flight will find the flag.
+    setStatusText(QStringLiteral("Stopping the shield…"));
+    publishPrivateShield(kStateRunning, QStringLiteral("Stopping once the plan answers…"));
+    return accepted();
+}
+
+void WalletUiWebBackend::failShieldLeg(const QString& leg, const QString& why)
+{
+    announce(why);
+    setStatusText(why);
+    setShieldLeg(leg, kStateFailed);
+    finishShield(kStateFailed, QString(), why);
+}
+
+void WalletUiWebBackend::publishPrivateShield(const QString& state, const QString& note,
+                                              const QString& error)
+{
+    QJsonObject shield;
+    shield.insert(QStringLiteral("state"), state);
+    shield.insert(QStringLiteral("leg"), m_shieldLeg);
+    // THE HASHES BELONG TO THE LEG THAT PRODUCED THEM, so a user looking at a
+    // route can take the one they need to a block explorer without counting
+    // transactions.
+    QJsonArray legs;
+    for (const QJsonValue& v : m_shieldLegs) {
+        QJsonObject entry = v.toObject();
+        QJsonArray hashes;
+        for (const QJsonValue& t : m_shieldTxs) {
+            const QJsonObject tx = t.toObject();
+            if (tx.value(QStringLiteral("leg")).toString()
+                    == entry.value(QStringLiteral("name")).toString()
+                && tx.contains(QStringLiteral("hash")))
+                hashes.append(tx.value(QStringLiteral("hash")));
+        }
+        if (!hashes.isEmpty())
+            entry.insert(QStringLiteral("hashes"), hashes);
+        legs.append(entry);
+    }
+    shield.insert(QStringLiteral("legs"), legs);
+    // WHETHER THE BUTTON SHOULD BE THERE, decided here rather than by a view
+    // reading six states and guessing. Harder than the send's: a shield stops
+    // being cancellable the moment its first transaction is handed over, not
+    // when the route ends.
+    shield.insert(QStringLiteral("cancellable"), m_shieldRunning && !m_shieldBroadcast);
+    if (!note.isEmpty())
+        shield.insert(QStringLiteral("note"), note);
+    if (!error.isEmpty())
+        shield.insert(QStringLiteral("error"), error);
+
+    QJsonObject out;
+    out.insert(QStringLiteral("shield"), shield);
+    setPrivateShieldJson(jsonText(out));
+    announce(QStringLiteral("private shield %1: %2").arg(state, jsonText(shield)));
+}
+
+void WalletUiWebBackend::finishShield(const QString& state, const QString& note,
+                                      const QString& error)
+{
+    m_shieldRunning = false;
+    publishPrivateShield(state, note, error);
 }

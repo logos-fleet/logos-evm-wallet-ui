@@ -65,6 +65,10 @@ Item {
     // See `privateSendJson` in wallet_ui.rep.
     readonly property var privateSend: parseField(backend ? backend.privateSendJson : "", "send", ({}))
     readonly property var privateSendLegs: privateSend.legs || []
+    // The other direction: public funds going INTO the pool, leg by leg.
+    // See `privateShieldJson` in wallet_ui.rep.
+    readonly property var privateShield: parseField(backend ? backend.privateShieldJson : "", "shield", ({}))
+    readonly property var privateShieldLegs: privateShield.legs || []
     // Where Private sits in the tab bar. Named because selectTab, the tab bar
     // and docs/specs.md all have to quote the same number — see the tab bar
     // below for why it is APPENDED rather than placed next to Send.
@@ -88,12 +92,20 @@ Item {
         return Theme.palette.textSecondary
     }
 
-    // "2 · prove — running". One line per leg of a send, so the route is
-    // readable as a whole and a leg that was SKIPPED is visibly not a leg that
-    // was run. Built here rather than in the delegate for the same reason
+    // "2 · prove — running". One line per leg of a route, so it is readable as a
+    // whole and a leg that was SKIPPED is visibly not a leg that was run. Built
+    // here rather than in the delegate for the same reason
     // `privateSyncProgressLine` is: the delegate should bind, not compute.
-    function privateSendLegLine(index, leg) {
-        return (index + 1) + " · " + leg.name + " — " + leg.state
+    //
+    // ONE FUNCTION FOR BOTH ROUTES, because they are one shape. Where a leg
+    // carries the transaction `hashes` it produced — only the shield's do — they
+    // are appended: they are the one thing a user can take to a block explorer,
+    // and the reason a mined leg is worth showing at all.
+    function privateLegLine(index, leg) {
+        var line = (index + 1) + " · " + leg.name + " — " + leg.state
+        if (leg.hashes && leg.hashes.length)
+            line += "  ·  " + leg.hashes.join(", ")
+        return line
     }
 
     // What the Private tab's send form hands the backend. `owner` is the
@@ -107,6 +119,18 @@ Item {
                                 memo: privMemo.text,
                                 owner: acctBox.currentText,
                                 bundlerUrl: privBundler.text })
+    }
+
+    // What the Private tab's shield form hands the backend. `owner` is the
+    // selected account: unlike a private send, a shield is PUBLIC transactions
+    // this account signs and pays the gas for, which is why the same dropdown
+    // means something stronger here.
+    function buildPrivateShield() {
+        return JSON.stringify({ chainId: activeSendChainId(),
+                                owner: acctBox.currentText,
+                                asset: shieldAsset.text,
+                                amount: shieldAmount.text,
+                                wrap: shieldWrap.checked })
     }
 
     // "40%  ·  600 blocks to go  ·  about 6 s left" — joined from the parts that
@@ -660,13 +684,109 @@ Item {
                     // happening, and because a leg marked `skipped` is a
                     // different claim from one marked `done`.
                     //
-                    // FOUR LEGS AND NOT SIX. `wrap` / `approve` / `shield` put
-                    // funds INTO the shielded pool and end in public
-                    // transactions this build cannot sign (the coordinator owns
-                    // sends and has no mobile build). This is the send of funds
-                    // that are already shielded: walk the tree, prove, have a
-                    // human approve, submit. The page names its own legs and
-                    // invents none.
+                    // FOUR LEGS AND NOT SIX, because the other two routes are
+                    // two operations and not one. `wrap` / `approve` / `shield`
+                    // put funds INTO the pool and are the form above; this is
+                    // the send of funds that are already in it — walk the tree,
+                    // prove, have a human approve, submit. Each page names its
+                    // own legs and invents none.
+                    // ── the route INTO the pool ──────────────────────────
+                    //
+                    // #235 clause 1 names six legs; the route below is the last
+                    // three and this is the first three, plus the two waits
+                    // that are not the chain's — `plan` (the calldata and the
+                    // numbers) and `sign` (a human in the Signer app). Put
+                    // ABOVE the send because it is what has to happen first:
+                    // there is nothing to send privately until something has
+                    // been shielded.
+                    //
+                    // ONE APPROVAL FOR THE WHOLE ROUTE, which is why there is
+                    // one button and not three. The keystore signs every leg
+                    // under a single key derivation with consecutive nonces,
+                    // so the wrap, the allowance and the shield are answered
+                    // once and executed in order.
+                    LogosText {
+                        Layout.topMargin: Theme.spacing.medium
+                        text: "Shield into the pool"; font.weight: Theme.typography.weightBold
+                    }
+                    LogosText {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        text: "Public funds going in. The selected account signs every " +
+                              "transaction of the route in one go in the Signer app, and " +
+                              "pays the gas for all of them."
+                    }
+                    LogosTextField { id: shieldAsset; objectName: "privateShieldAssetField"; Layout.fillWidth: true; placeholderText: "Asset (ERC-20 address, 0x…)" }
+                    LogosTextField { id: shieldAmount; objectName: "privateShieldAmountField"; Layout.fillWidth: true; placeholderText: "Amount (base units, whole number)" }
+                    // WHAT THE BOX ACTUALLY DOES, said in the label: a WETH9
+                    // `deposit()` ON THE ASSET ABOVE. The wallet does not go
+                    // looking for a chain's wrapped token — the asset the user
+                    // typed is the one that is called.
+                    LogosCheckbox {
+                        id: shieldWrap
+                        objectName: "privateShieldWrapBox"
+                        text: "Mint the asset first (deposit() — for a wrapped native token)"
+                    }
+
+                    LogosText {
+                        objectName: "privateShieldState"
+                        Layout.fillWidth: true
+                        text: "shield: " + (root.privateShield.state || "idle")
+                              + (root.privateShield.leg ? "  ·  " + root.privateShield.leg : "")
+                        color: root.privateStateColor(root.privateShield.state)
+                    }
+                    ColumnLayout {
+                        objectName: "privateShieldLegs"
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Repeater {
+                            model: root.privateShieldLegs
+                            LogosText {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                font.pixelSize: Theme.typography.secondaryText
+                                color: root.privateStateColor(modelData.state)
+                                text: root.privateLegLine(index, modelData)
+                            }
+                        }
+                    }
+                    LogosText {
+                        objectName: "privateShieldNote"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        visible: text.length > 0
+                        text: root.privateShield.note || ""
+                    }
+                    LogosText {
+                        objectName: "privateShieldError"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.error
+                        visible: text.length > 0
+                        text: root.privateShield.error || ""
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        LogosButton {
+                            objectName: "privateShieldButton"
+                            text: "Shield"
+                            enabled: root.ready && root.privateShield.state !== "running"
+                            onClicked: logos.watch(backend.startPrivateShield(root.buildPrivateShield()),
+                                                   function (r) {}, function (e) {})
+                        }
+                        // THE LINE IS HARDER THAN THE SEND'S, and the backend
+                        // is the one that knows where it is: `cancellable`
+                        // goes false the moment the first signed transaction
+                        // is handed to eth_rpc, because from then on the route
+                        // is nonce-ordered in a mempool and cannot be recalled.
+                        LogosButton {
+                            objectName: "privateShieldCancelButton"
+                            text: "Cancel shield"
+                            enabled: root.ready && root.privateShield.cancellable === true
+                            onClicked: logos.watch(backend.cancelPrivateShield(),
+                                                   function (r) {}, function (e) {})
+                        }
+                    }
+
                     LogosText {
                         Layout.topMargin: Theme.spacing.medium
                         text: "Send privately"; font.weight: Theme.typography.weightBold
@@ -702,7 +822,7 @@ Item {
                                 Layout.fillWidth: true
                                 font.pixelSize: Theme.typography.secondaryText
                                 color: root.privateStateColor(modelData.state)
-                                text: root.privateSendLegLine(index, modelData)
+                                text: root.privateLegLine(index, modelData)
                             }
                         }
                     }

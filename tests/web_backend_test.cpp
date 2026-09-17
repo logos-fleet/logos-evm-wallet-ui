@@ -1287,6 +1287,595 @@ void cancellingDuringTheSyncLegKeepsTheBlocks()
         pass("a cancel during the walk keeps every window it finished, and no proof is asked for");
 }
 
+
+// ── the other direction: public funds going INTO the pool ────────────────────
+//
+// #235 clause 1 names six legs — "wrap / approve / shield / sync / prove /
+// broadcast" — and the cases above cover the last three, the send of a balance
+// that is already shielded. These cover the first three, which are how a
+// balance gets there, and the two that make them possible: `plan` (the calldata
+// and the numbers) and `sign` (ONE approval request, answered once by a human).
+//
+// WHAT IS BEING ASSERTED, as everywhere in this file: the ASKING. Which module,
+// which method, with what arguments, in what order — and in particular that the
+// allowance is asked for BEFORE the shield with a consecutive nonce, because
+// that ordering is the whole reason all three can go out without a receipt
+// between them.
+
+// The RailgunSmartWallet, as `prepare_shield` names it in the `to` of the
+// transaction it answers with. That address is where the allowance goes, and
+// asserting it comes from the reply rather than from a constant in the wallet
+// is the point of the case below.
+const char* kRailgunWallet = "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238";
+const char* kWeth = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
+const char* kOwner = "0x493A0000000000000000000000000000000dDEEa";
+
+QString shieldJson(bool wrap = true, const QString& amount = QStringLiteral("1000000000000000"))
+{
+    return QString::fromUtf8(
+        QJsonDocument(QJsonObject{ { "chainId", 11155111 },
+                                   { "owner", kOwner },
+                                   { "asset", kWeth },
+                                   { "amount", amount },
+                                   { "wrap", wrap } })
+            .toJson(QJsonDocument::Compact));
+}
+
+QJsonObject shieldState(const WalletUiWebBackend& backend)
+{
+    return parse(backend.privateShieldJson()).value(QStringLiteral("shield")).toObject();
+}
+
+QString shieldLeg(const WalletUiWebBackend& backend, const QString& name)
+{
+    for (const QJsonValue& v : shieldState(backend).value(QStringLiteral("legs")).toArray()) {
+        const QJsonObject leg = v.toObject();
+        if (leg.value(QStringLiteral("name")).toString() == name)
+            return leg.value(QStringLiteral("state")).toString();
+    }
+    return QString();
+}
+
+QJsonObject shieldTxsReply()
+{
+    return QJsonObject{ { "ok", true },
+                        { "txs", QJsonArray{ QJsonObject{ { "to", kRailgunWallet },
+                                                          { "data", "0xdeadbeef" },
+                                                          { "value", "0x0" } } } } };
+}
+
+// Drive the route as far as the approval request, answering every read on the
+// way. Returns the index of the `request_approval` call, or -1 if the sequence
+// broke — every case below starts here, and a case that re-spelled it would be
+// asserting the plan four times over.
+int planAShield(WalletUiWebBackend& backend, bool wrap = true)
+{
+    backend.startPrivateShield(shieldJson(wrap));
+
+    // The chain is configured before anything is asked OF it — the same rule
+    // every eth_rpc read in this file follows.
+    if (!expectCall(0, QStringLiteral("eth_rpc_module"), QStringLiteral("set_chain_config")))
+        return -1;
+    fake_door::answerBool(0, true);
+
+    const std::optional<fake_door::Call> prep =
+        expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("prepare_shield"));
+    if (!prep)
+        return -1;
+    check(prep->args.size() == 1 && prep->args.at(0).isString(),
+          QStringLiteral("prepare_shield was not given its params as one JSON string: %1")
+              .arg(describe(*prep)));
+    fake_door::answerJson(1, shieldTxsReply());
+
+    const std::optional<fake_door::Call> nonce =
+        expectCall(2, QStringLiteral("eth_rpc_module"), QStringLiteral("get_transaction_count"));
+    if (!nonce)
+        return -1;
+    check(nonce->args.size() == 2 && nonce->args.at(1).toString() == QLatin1String(kOwner),
+          QStringLiteral("the nonce was not read for the account that signs: %1")
+              .arg(describe(*nonce)));
+    fake_door::answerJson(2, QJsonObject{ { "ok", true }, { "result", "0x7" } });
+
+    if (!expectCall(3, QStringLiteral("eth_rpc_module"), QStringLiteral("gas_price")))
+        return -1;
+    fake_door::answerJson(3, QJsonObject{ { "ok", true }, { "result", "0x3b9aca00" } });
+    return 4;
+}
+
+// Answer the approval request and the poll that follows it, and hand back the
+// signatures. `legs` is how many transactions the bundle carries.
+bool approveAShield(int requestCall, int legs)
+{
+    if (!expectCall(requestCall, QStringLiteral("keystore_module"),
+                    QStringLiteral("request_approval")))
+        return false;
+    fake_door::answerJson(requestCall, QJsonObject{ { "ok", true },
+                                                    { "handle", "ap-1" },
+                                                    { "receipt", "rc-1" } });
+
+    if (!expectCall(requestCall + 1, QStringLiteral("keystore_module"),
+                    QStringLiteral("approval_status")))
+        return false;
+    fake_door::answerJson(requestCall + 1,
+                          QJsonObject{ { "ok", true }, { "state", "settled" },
+                                       { "reason", "approved" } });
+
+    if (!expectCall(requestCall + 2, QStringLiteral("keystore_module"),
+                    QStringLiteral("fetch_result")))
+        return false;
+    QJsonArray signed_;
+    for (int i = 0; i < legs; ++i)
+        signed_.append(QStringLiteral("0xraw%1").arg(i));
+    fake_door::answerJson(requestCall + 2, QJsonObject{ { "ok", true }, { "signed", signed_ } });
+    return true;
+}
+
+// ── the route is named before it is walked ───────────────────────────────────
+//
+// #235's "the app has not hung" starts before anything is running: a page that
+// names the five legs it would take, from its first paint, has already told a
+// user what a shield consists of and that nothing has been started.
+void theShieldRouteIsPublishedFromTheFirstPaint()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    check(shieldState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("idle"),
+          QStringLiteral("a fresh page does not publish an idle shield: %1")
+              .arg(backend.privateShieldJson()));
+    const QJsonArray legs = shieldState(backend).value(QStringLiteral("legs")).toArray();
+    QStringList named;
+    for (const QJsonValue& v : legs)
+        named << v.toObject().value(QStringLiteral("name")).toString();
+    check(named == QStringList({ "plan", "sign", "wrap", "approve", "shield" }),
+          QStringLiteral("the route is not named in the order it is walked: %1")
+              .arg(named.join(QStringLiteral(", "))));
+    check(shieldState(backend).value(QStringLiteral("cancellable")).toBool() == false,
+          QStringLiteral("a shield nobody started offers a cancel: %1")
+              .arg(backend.privateShieldJson()));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("naming the route spent %1 call(s)").arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("the shield's route is named from the first paint, before anything is walked");
+}
+
+void aShieldNamesEveryLegItPutsOnChain()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend);
+    if (request < 0)
+        return;
+
+    // LEG 1 — plan. Done by the time the human is asked: the calldata, the
+    // nonce and the fee are all in hand, and none of them cost the user a
+    // decision.
+    check(shieldLeg(backend, QStringLiteral("plan")) == QStringLiteral("done"),
+          QStringLiteral("the plan leg is not done once the reads have landed: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("sign"),
+          QStringLiteral("the running leg is not the signature: %1")
+              .arg(backend.privateShieldJson()));
+
+    // LEG 2 — sign. ONE request, carrying the whole route: the human sees the
+    // wrap, the allowance and the shield together and answers once.
+    const std::optional<fake_door::Call> ask =
+        expectCall(request, QStringLiteral("keystore_module"), QStringLiteral("request_approval"));
+    if (!ask)
+        return;
+    const QJsonObject intent =
+        parse(ask->args.isEmpty() ? QString() : ask->args.at(0).toString());
+    check(intent.value(QStringLiteral("address")).toString() == QLatin1String(kOwner),
+          QStringLiteral("the intent is not addressed to the account that signs: %1")
+              .arg(describe(*ask)));
+    const QJsonArray legs = intent.value(QStringLiteral("legs")).toArray();
+    check(legs.size() == 3,
+          QStringLiteral("a wrap+approve+shield route was not one bundle of three: %1")
+              .arg(describe(*ask)));
+    if (legs.size() != 3)
+        return;
+
+    // THE ORDER IS THE CONTRACT, and so are the nonces: the allowance must be
+    // executed before the shield, and consecutive nonces are what makes the
+    // chain do that without this wallet waiting for a receipt in between.
+    const QJsonObject wrapTx = legs.at(0).toObject().value(QStringLiteral("tx")).toObject();
+    const QJsonObject allowTx = legs.at(1).toObject().value(QStringLiteral("tx")).toObject();
+    const QJsonObject shieldTx = legs.at(2).toObject().value(QStringLiteral("tx")).toObject();
+    check(wrapTx.value(QStringLiteral("nonce")).toString() == QStringLiteral("0x7")
+              && allowTx.value(QStringLiteral("nonce")).toString() == QStringLiteral("0x8")
+              && shieldTx.value(QStringLiteral("nonce")).toString() == QStringLiteral("0x9"),
+          QStringLiteral("the bundle's nonces are not consecutive from the account's: %1")
+              .arg(describe(*ask)));
+
+    // The wrap is WETH9's payable `deposit()` ON THE ASSET ITSELF — that is
+    // what turns native ETH into the ERC-20 RAILGUN can take.
+    check(wrapTx.value(QStringLiteral("to")).toString().toLower()
+              == QString(QLatin1String(kWeth)).toLower(),
+          QStringLiteral("the wrap is not a call on the asset: %1").arg(describe(*ask)));
+    check(wrapTx.value(QStringLiteral("data")).toString() == QStringLiteral("0xd0e30db0"),
+          QStringLiteral("the wrap is not deposit(): %1").arg(describe(*ask)));
+    check(wrapTx.value(QStringLiteral("value")).toString() == QStringLiteral("1000000000000000"),
+          QStringLiteral("the wrap does not pay the amount being shielded: %1")
+              .arg(describe(*ask)));
+
+    // The allowance is `approve(spender, amount)` on the asset, and the SPENDER
+    // is the address `prepare_shield` answered with — read off the reply, never
+    // a constant in this wallet.
+    const QString allowData = allowTx.value(QStringLiteral("data")).toString();
+    check(allowData.startsWith(QStringLiteral("0x095ea7b3")),
+          QStringLiteral("the allowance leg is not approve(): %1").arg(allowData));
+    check(allowData.contains(QString(QLatin1String(kRailgunWallet)).mid(2)),
+          QStringLiteral("the allowance does not name the wallet prepare_shield answered "
+                         "with as its spender: %1")
+              .arg(allowData));
+    check(allowData.endsWith(QStringLiteral("00038d7ea4c68000")),
+          QStringLiteral("the allowance is not for the amount being shielded: %1").arg(allowData));
+
+    // ...and the shield is the transaction the module built, passed through.
+    check(shieldTx.value(QStringLiteral("to")).toString() == QLatin1String(kRailgunWallet)
+              && shieldTx.value(QStringLiteral("data")).toString() == QStringLiteral("0xdeadbeef"),
+          QStringLiteral("the shield leg is not the module's own transaction: %1")
+              .arg(describe(*ask)));
+
+    if (!approveAShield(request, 3))
+        return;
+    check(shieldLeg(backend, QStringLiteral("sign")) == QStringLiteral("done"),
+          QStringLiteral("the sign leg is not done once the signatures landed: %1")
+              .arg(backend.privateShieldJson()));
+
+    // LEGS 3-5 — the chain. Every raw transaction goes out back to back: the
+    // nonces already order them, so waiting for a receipt between them would
+    // only make the user wait twelve seconds longer per leg for nothing.
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<fake_door::Call> sent =
+            expectCall(request + 3 + i, QStringLiteral("eth_rpc_module"),
+                       QStringLiteral("send_raw_transaction"));
+        if (!sent)
+            return;
+        check(sent->args.size() == 2
+                  && sent->args.at(1).toString() == QStringLiteral("0xraw%1").arg(i),
+              QStringLiteral("transaction %1 was not the one the keystore signed: %2")
+                  .arg(i)
+                  .arg(describe(*sent)));
+        fake_door::answerJson(request + 3 + i,
+                              QJsonObject{ { "ok", true },
+                                           { "hash", QStringLiteral("0xh%1").arg(i) } });
+    }
+
+    // The signatures have been spent, so the keystore is told to wipe its copy.
+    if (!expectCall(request + 6, QStringLiteral("keystore_module"), QStringLiteral("ack_result")))
+        return;
+    fake_door::answerBool(request + 6, true);
+
+    // A LEG IS `running` WHEN ITS TRANSACTION IS IN A MEMPOOL AND `done` WHEN
+    // IT IS MINED, which is the only honest reading of a wait the chain owns.
+    check(shieldLeg(backend, QStringLiteral("wrap")) == QStringLiteral("running"),
+          QStringLiteral("a broadcast leg is not running: %1").arg(backend.privateShieldJson()));
+
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<fake_door::Call> receipt =
+            expectCall(request + 7 + i, QStringLiteral("eth_rpc_module"),
+                       QStringLiteral("get_transaction_receipt"));
+        if (!receipt)
+            return;
+        check(receipt->args.size() == 2
+                  && receipt->args.at(1).toString() == QStringLiteral("0xh%1").arg(i),
+              QStringLiteral("receipt %1 was not followed for the hash it was sent under: %2")
+                  .arg(i)
+                  .arg(describe(*receipt)));
+        fake_door::answerJson(request + 7 + i,
+                              QJsonObject{ { "ok", true },
+                                           { "result", QJsonObject{ { "status", "0x1" },
+                                                                    { "blockNumber", "0x64" } } } });
+    }
+
+    check(shieldLeg(backend, QStringLiteral("wrap")) == QStringLiteral("done")
+              && shieldLeg(backend, QStringLiteral("approve")) == QStringLiteral("done")
+              && shieldLeg(backend, QStringLiteral("shield")) == QStringLiteral("done"),
+          QStringLiteral("a mined route did not end with every leg done: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("done"),
+          QStringLiteral("a mined route is not done: %1").arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("cancellable")).toBool() == false,
+          QStringLiteral("a finished shield still offers a cancel: %1")
+              .arg(backend.privateShieldJson()));
+
+    if (failures == before)
+        pass("a shield names every leg it puts on chain, signs them as one bundle with "
+             "consecutive nonces, and follows each to its receipt");
+}
+
+// ── a leg that was not needed is not a leg that ran ──────────────────────────
+//
+// The same distinction the send's route makes between `skipped` and `done`, on
+// the one leg of a shield that is optional. A caller shielding an ERC-20 they
+// already hold does not wrap anything, and a route that reported `done` for
+// that would be claiming a transaction the wallet never sent.
+void aShieldWithoutAWrapSaysSkippedAndNotDone()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend, /*wrap=*/false);
+    if (request < 0)
+        return;
+
+    check(shieldLeg(backend, QStringLiteral("wrap")) == QStringLiteral("skipped"),
+          QStringLiteral("a route that wraps nothing did not say skipped: %1")
+              .arg(backend.privateShieldJson()));
+
+    const std::optional<fake_door::Call> ask =
+        expectCall(request, QStringLiteral("keystore_module"), QStringLiteral("request_approval"));
+    if (!ask)
+        return;
+    const QJsonArray legs = parse(ask->args.at(0).toString())
+                                .value(QStringLiteral("legs"))
+                                .toArray();
+    check(legs.size() == 2,
+          QStringLiteral("a route with no wrap still asked a human to sign three things: %1")
+              .arg(describe(*ask)));
+    if (legs.size() != 2)
+        return;
+    check(legs.at(0).toObject().value(QStringLiteral("tx")).toObject()
+              .value(QStringLiteral("nonce")).toString() == QStringLiteral("0x7"),
+          QStringLiteral("the allowance did not take the account's own next nonce: %1")
+              .arg(describe(*ask)));
+
+    if (failures == before)
+        pass("a shield that wraps nothing skips the leg, and signs two transactions "
+             "rather than three");
+}
+
+// ── leaving, and what leaving costs on this route ────────────────────────────
+//
+// #235 clause 2 for the direction that spends money. While a human is deciding,
+// nothing has been signed and nothing has been broadcast: the request comes out
+// of the Signer's queue and the note says so where the user is looking.
+void cancellingWhileTheHumanDecidesTakesTheRequestBack()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend);
+    if (request < 0)
+        return;
+    if (!expectCall(request, QStringLiteral("keystore_module"),
+                    QStringLiteral("request_approval")))
+        return;
+    fake_door::answerJson(request, QJsonObject{ { "ok", true },
+                                                { "handle", "ap-1" },
+                                                { "receipt", "rc-1" } });
+    if (!expectCall(request + 1, QStringLiteral("keystore_module"),
+                    QStringLiteral("approval_status")))
+        return;
+    fake_door::answerJson(request + 1, QJsonObject{ { "ok", true }, { "state", "offered" } });
+
+    check(shieldState(backend).value(QStringLiteral("cancellable")).toBool(),
+          QStringLiteral("a shield waiting on a human is not offered a cancel: %1")
+              .arg(backend.privateShieldJson()));
+
+    const QJsonObject taken = parse(backend.cancelPrivateShield());
+    check(taken.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("cancelPrivateShield did not take the ask: %1")
+              .arg(backend.privateShieldJson()));
+
+    // The request is WITHDRAWN, by handle and receipt — not merely forgotten
+    // on this side, which would leave it sitting in a human's queue.
+    const std::optional<fake_door::Call> withdraw =
+        expectCall(request + 2, QStringLiteral("keystore_module"),
+                   QStringLiteral("cancel_approval"));
+    if (!withdraw)
+        return;
+    check(withdraw->args.size() == 2 && withdraw->args.at(0).toString() == QStringLiteral("ap-1")
+              && withdraw->args.at(1).toString() == QStringLiteral("rc-1"),
+          QStringLiteral("the withdrawal did not name the request it takes back: %1")
+              .arg(describe(*withdraw)));
+    fake_door::answerBool(request + 2, true);
+
+    check(shieldState(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("cancelled"),
+          QStringLiteral("a withdrawn shield is not cancelled: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldLeg(backend, QStringLiteral("sign")) == QStringLiteral("cancelled"),
+          QStringLiteral("the sign leg is not cancelled: %1").arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("note")).toString()
+              .contains(QStringLiteral("Nothing was spent")),
+          QStringLiteral("the note does not say what was not done: %1")
+              .arg(backend.privateShieldJson()));
+    // NOT ONE TRANSACTION WENT OUT.
+    for (const fake_door::Call& c : fake_door::calls)
+        check(c.method != QStringLiteral("send_raw_transaction"),
+              QStringLiteral("a cancelled shield still broadcast something: %1").arg(describe(c)));
+
+    if (failures == before)
+        pass("a cancel while a human is deciding takes the request back, and nothing "
+             "reached the chain");
+}
+
+// ── ...and the point where there is nothing to take back ─────────────────────
+//
+// The other half of clause 2, and a HARDER line than the send's: three
+// transactions signed with consecutive nonces are handed over back to back, so
+// the moment the first leaves, the route is the chain's.
+void aBroadcastShieldCannotBeRecalled()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend);
+    if (request < 0 || !approveAShield(request, 3))
+        return;
+
+    // The first transaction is in flight and has not even been answered yet.
+    if (!expectCall(request + 3, QStringLiteral("eth_rpc_module"),
+                    QStringLiteral("send_raw_transaction")))
+        return;
+    check(shieldState(backend).value(QStringLiteral("cancellable")).toBool() == false,
+          QStringLiteral("a shield already handed to the chain still offers a cancel: %1")
+              .arg(backend.privateShieldJson()));
+
+    const QJsonObject refused = parse(backend.cancelPrivateShield());
+    check(refused.value(QStringLiteral("ok")).toBool() == false,
+          QStringLiteral("cancelling a broadcast shield was accepted: %1")
+              .arg(backend.privateShieldJson()));
+    check(refused.value(QStringLiteral("error")).toString()
+              .contains(QStringLiteral("ordered by nonce")),
+          QStringLiteral("the refusal does not say why it cannot be recalled: %1")
+              .arg(refused.value(QStringLiteral("error")).toString()));
+    check(fake_door::calls.size() == request + 4,
+          QStringLiteral("the refused cancel still spent a call: %1 call(s) in all")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a shield whose transactions have been handed over refuses a cancel, and "
+             "says they are nonce-ordered and cannot be recalled");
+}
+
+// ── the human said no ────────────────────────────────────────────────────────
+void aDeclinedShieldEndsInTheSignersOwnWords()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend);
+    if (request < 0)
+        return;
+    if (!expectCall(request, QStringLiteral("keystore_module"),
+                    QStringLiteral("request_approval")))
+        return;
+    fake_door::answerJson(request, QJsonObject{ { "ok", true },
+                                                { "handle", "ap-1" },
+                                                { "receipt", "rc-1" } });
+    if (!expectCall(request + 1, QStringLiteral("keystore_module"),
+                    QStringLiteral("approval_status")))
+        return;
+    fake_door::answerJson(request + 1, QJsonObject{ { "ok", true },
+                                                    { "state", "settled" },
+                                                    { "reason", "rejected" } });
+
+    check(shieldState(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("failed"),
+          QStringLiteral("a declined shield did not end: %1").arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("error")).toString()
+              .contains(QStringLiteral("rejected")),
+          QStringLiteral("the decline is not reported in the signer's own word: %1")
+              .arg(backend.privateShieldJson()));
+    check(fake_door::calls.size() == request + 2,
+          QStringLiteral("a declined shield asked for the signatures anyway: %1 call(s)")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a declined shield ends there, in the signer's own word, and never asks "
+             "for signatures");
+}
+
+// ── a transaction that was mined and reverted ────────────────────────────────
+//
+// The failure this route cannot prevent and must not hide: gas is spent, the
+// state did not change, and every leg after it will not execute either because
+// the nonces are consecutive.
+void aMinedRevertIsReportedAsOne()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const int request = planAShield(backend);
+    if (request < 0 || !approveAShield(request, 3))
+        return;
+    for (int i = 0; i < 3; ++i) {
+        if (!expectCall(request + 3 + i, QStringLiteral("eth_rpc_module"),
+                        QStringLiteral("send_raw_transaction")))
+            return;
+        fake_door::answerJson(request + 3 + i,
+                              QJsonObject{ { "ok", true },
+                                           { "hash", QStringLiteral("0xh%1").arg(i) } });
+    }
+    if (!expectCall(request + 6, QStringLiteral("keystore_module"), QStringLiteral("ack_result")))
+        return;
+    fake_door::answerBool(request + 6, true);
+
+    // The wrap is mined; the allowance reverts.
+    if (!expectCall(request + 7, QStringLiteral("eth_rpc_module"),
+                    QStringLiteral("get_transaction_receipt")))
+        return;
+    fake_door::answerJson(request + 7,
+                          QJsonObject{ { "ok", true },
+                                       { "result", QJsonObject{ { "status", "0x1" } } } });
+    if (!expectCall(request + 8, QStringLiteral("eth_rpc_module"),
+                    QStringLiteral("get_transaction_receipt")))
+        return;
+    fake_door::answerJson(request + 8,
+                          QJsonObject{ { "ok", true },
+                                       { "result", QJsonObject{ { "status", "0x0" } } } });
+
+    check(shieldLeg(backend, QStringLiteral("wrap")) == QStringLiteral("done"),
+          QStringLiteral("the leg that WAS mined is not done: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldLeg(backend, QStringLiteral("approve")) == QStringLiteral("failed"),
+          QStringLiteral("the reverted leg is not failed: %1").arg(backend.privateShieldJson()));
+    check(shieldState(backend).value(QStringLiteral("error")).toString()
+              .contains(QStringLiteral("reverted")),
+          QStringLiteral("a mined revert is not named as one: %1")
+              .arg(backend.privateShieldJson()));
+    check(fake_door::calls.size() == request + 9,
+          QStringLiteral("the route kept going after a revert: %1 call(s)")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a transaction that was mined and reverted is named as one, and the route "
+             "stops there");
+}
+
+// ── what the wallet can see is wrong, it says here ───────────────────────────
+//
+// The same rule `missingSendField` follows. An amount that is not a decimal
+// whole number cannot be encoded into an ERC-20 argument at all, so refusing it
+// here costs no round trip and names nothing that is not at fault.
+void aShieldWithAnUnencodableAmountIsRefusedWithoutAsking()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const QJsonObject refused = parse(backend.startPrivateShield(shieldJson(true, "0.001")));
+    check(refused.value(QStringLiteral("ok")).toBool() == false,
+          QStringLiteral("a fractional amount was accepted: %1")
+              .arg(backend.privateShieldJson()));
+    check(refused.value(QStringLiteral("error")).toString()
+              .contains(QStringLiteral("base units")),
+          QStringLiteral("the refusal does not say what an amount has to be: %1")
+              .arg(refused.value(QStringLiteral("error")).toString()));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("a refused shield still spent %1 call(s)")
+              .arg(fake_door::calls.size()));
+
+    // ...AND THE PANEL THE USER IS LOOKING AT SAYS SO. Measured on an iPad Air
+    // 13-inch simulator: a device with no account in its keystore pressed
+    // `Shield`, the form had no `owner`, and `privateShieldJson` was never
+    // published — so the refusal existed only on the status line and the route
+    // panel was blank (logos-workspace#235).
+    check(shieldState(backend).value(QStringLiteral("error")).toString()
+              == refused.value(QStringLiteral("error")).toString(),
+          QStringLiteral("the refusal did not reach the shield's own surface: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldLeg(backend, QStringLiteral("plan")) == QStringLiteral("pending"),
+          QStringLiteral("a refused shield did not lay its route out fresh: %1")
+              .arg(backend.privateShieldJson()));
+
+    if (failures == before)
+        pass("an amount this wallet cannot encode is refused here, without a round trip, "
+             "and the refusal reaches the panel the user is looking at");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1319,6 +1908,14 @@ int main(int argc, char** argv)
     aSendWithNoBundlerIsRefusedWithoutAsking();
     aSendJoinsAWalkAlreadyRunning();
     cancellingDuringTheSyncLegKeepsTheBlocks();
+    theShieldRouteIsPublishedFromTheFirstPaint();
+    aShieldNamesEveryLegItPutsOnChain();
+    aShieldWithoutAWrapSaysSkippedAndNotDone();
+    cancellingWhileTheHumanDecidesTakesTheRequestBack();
+    aBroadcastShieldCannotBeRecalled();
+    aDeclinedShieldEndsInTheSignersOwnWords();
+    aMinedRevertIsReportedAsOne();
+    aShieldWithAnUnencodableAmountIsRefusedWithoutAsking();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

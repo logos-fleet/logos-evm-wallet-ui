@@ -4,6 +4,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include <initializer_list>
+
 // Generated umbrella: modules() → typed callers + typed event accessors for the
 // modules in metadata.json#dependencies (here: wallet_backend_module for
 // everything the coordinator owns, keystore_module for account creation).
@@ -279,24 +281,46 @@ QString privateSyncUnavailable()
     return jsonText(QJsonObject{ { QStringLiteral("sync"), sync } });
 }
 
-// THE SEND'S SURFACE, IN THE SAME SHAPE AND WITH THE SAME VERDICT. The route is
-// still spelled out — a reader of this build should be able to see what a
-// private send would consist of — and every leg carries `unavailable` rather
-// than `pending`, because `pending` would promise a leg that is coming.
-QString privateSendUnavailable()
+// A ROUTE'S SURFACE, IN THE SAME SHAPE AND WITH THE SAME VERDICT. The route is
+// still spelled out — a reader of this build should be able to see what it
+// would consist of — and every leg carries `unavailable` rather than `pending`,
+// because `pending` would promise a leg that is coming. Both private routes are
+// refused in one function because the `web` variant publishes them in one
+// shape: the same QML renders either half.
+QString routeUnavailable(const QString& key, std::initializer_list<QString> legNames)
 {
     QJsonArray legs;
-    for (const QString& leg : { QStringLiteral("sync"), QStringLiteral("prove"),
-                                QStringLiteral("approve"), QStringLiteral("broadcast") })
+    for (const QString& leg : legNames)
         legs.append(QJsonObject{ { QStringLiteral("name"), leg },
                                  { QStringLiteral("state"), QStringLiteral("unavailable") } });
-    QJsonObject send;
-    send.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
-    send.insert(QStringLiteral("leg"), QString());
-    send.insert(QStringLiteral("legs"), legs);
-    send.insert(QStringLiteral("cancellable"), false);
-    send.insert(QStringLiteral("error"), kRailgunAbsent);
-    return jsonText(QJsonObject{ { QStringLiteral("send"), send } });
+    QJsonObject route;
+    route.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
+    route.insert(QStringLiteral("leg"), QString());
+    route.insert(QStringLiteral("legs"), legs);
+    route.insert(QStringLiteral("cancellable"), false);
+    route.insert(QStringLiteral("error"), kRailgunAbsent);
+    return jsonText(QJsonObject{ { key, route } });
+}
+
+QString privateSendUnavailable()
+{
+    return routeUnavailable(QStringLiteral("send"),
+                            { QStringLiteral("sync"), QStringLiteral("prove"),
+                              QStringLiteral("approve"), QStringLiteral("broadcast") });
+}
+
+// THE ROUTE INTO THE POOL is refused for the same reason and not a weaker one.
+// A shield ends in public transactions this account would sign — the signing
+// path is `keystore_module`, which this desktop build DOES reach — but the
+// calldata comes out of `railgun_module`, and without it there is nothing to
+// sign. So the refusal names the module that is missing, not the one that is
+// present.
+QString privateShieldUnavailable()
+{
+    return routeUnavailable(QStringLiteral("shield"),
+                            { QStringLiteral("plan"), QStringLiteral("sign"),
+                              QStringLiteral("wrap"), QStringLiteral("approve"),
+                              QStringLiteral("shield") });
 }
 
 } // namespace
@@ -305,6 +329,7 @@ void WalletUiBackend::refreshPrivateSync()
 {
     setPrivateSyncJson(privateSyncUnavailable());
     setPrivateSendJson(privateSendUnavailable());
+    setPrivateShieldJson(privateShieldUnavailable());
 }
 
 // Both controls on the Private tab answer the same way here, because both are
@@ -314,6 +339,7 @@ QString WalletUiBackend::refuseWithoutRailgun()
 {
     setPrivateSyncJson(privateSyncUnavailable());
     setPrivateSendJson(privateSendUnavailable());
+    setPrivateShieldJson(privateShieldUnavailable());
     setStatusText(kRailgunAbsent);
     return jsonText(QJsonObject{ { QStringLiteral("ok"), false },
                                  { QStringLiteral("error"), kRailgunAbsent } });
@@ -338,6 +364,17 @@ QString WalletUiBackend::startPrivateSend(QString sendJson)
 }
 
 QString WalletUiBackend::cancelPrivateSend()
+{
+    return refuseWithoutRailgun();
+}
+
+QString WalletUiBackend::startPrivateShield(QString shieldJson)
+{
+    Q_UNUSED(shieldJson)
+    return refuseWithoutRailgun();
+}
+
+QString WalletUiBackend::cancelPrivateShield()
 {
     return refuseWithoutRailgun();
 }

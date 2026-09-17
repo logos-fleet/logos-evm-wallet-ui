@@ -47,6 +47,26 @@ class WalletUi
     // succeed (logos-workspace#235). Nothing here is a guess — every state
     // change is a reply that landed.
     PROP(QString privateSendJson READONLY)
+    // THE OTHER DIRECTION — PUBLIC FUNDS GOING IN, leg by leg, as one JSON
+    // object: `{ "shield": { state, leg, legs: [{ name, state, hashes? }], … } }`.
+    //
+    // `privateSendJson` above spends a balance that is ALREADY shielded.
+    // This is how a balance gets there: `plan` (ask `railgun_module` for the
+    // shield calldata and read the account's nonce and the chain's gas price),
+    // `sign` (one approval request in front of a human in the Signer app,
+    // carrying every transaction of the route under a single key derivation),
+    // then `wrap` (WETH9 `deposit()` — only when the caller asked to mint the
+    // asset out of native ETH), `approve` (the ERC-20 allowance the shield
+    // spends) and `shield` (the RailgunSmartWallet call itself). Each of the
+    // last three is reported `running` when its signed transaction has been
+    // broadcast and `done` when its receipt is mined, so the wait a user sees
+    // is the chain's and is named.
+    //
+    // WHY IT IS A SECOND PROP AND NOT MORE LEGS ON THE ONE ABOVE: a shield and
+    // a private send are separate operations a user starts separately, and a
+    // route that showed six legs of which three were permanently `skipped`
+    // would be describing a thing this wallet never does in one go.
+    PROP(QString privateShieldJson READONLY)
 
     // Config / privacy
     SLOT(bool setProxyConfig(QString proxyJson))
@@ -127,4 +147,24 @@ class WalletUi
     // `broadcast` has happened there is nothing to cancel — the operation is
     // the chain's — and this REFUSES rather than pretending otherwise.
     SLOT(QString cancelPrivateSend())
+
+    // PUT PUBLIC FUNDS INTO THE POOL. `shieldJson` is
+    // `{chainId, owner, asset, amount, wrap?}` — `owner` is the EOA that signs
+    // and pays the gas, `asset` is the ERC-20 being shielded, `amount` is in
+    // the asset's own base units, and `wrap: true` asks for a WETH9
+    // `deposit()` on `asset` first, which is how native ETH becomes the ERC-20
+    // RAILGUN can take. Progress lands in `privateShieldJson`.
+    //
+    // ONE HUMAN APPROVAL FOR THE WHOLE ROUTE. `keystore_module` signs a bundle
+    // of legs under a single key derivation, so the wrap, the allowance and
+    // the shield are shown together and answered once — and they are signed
+    // with consecutive nonces, so the chain executes them in that order
+    // without this wallet waiting for a receipt between them.
+    SLOT(QString startPrivateShield(QString shieldJson))
+    // GIVE UP, and what that costs depends on how far the route got. Before
+    // the signatures are collected there is nothing on chain and the approval
+    // request is withdrawn from the Signer's queue. Once ANY transaction has
+    // been broadcast this REFUSES: the transactions are the chain's, they are
+    // nonce-ordered and they will be mined.
+    SLOT(QString cancelPrivateShield())
 }

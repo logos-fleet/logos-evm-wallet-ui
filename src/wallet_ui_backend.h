@@ -53,6 +53,8 @@ public:
     QString cancelPrivateSync() override;
     QString startPrivateSend(QString sendJson) override;
     QString cancelPrivateSend() override;
+    QString startPrivateShield(QString shieldJson) override;
+    QString cancelPrivateShield() override;
 
 private:
     // Shared by sendNative/sendErc20: record the request id and tell the user
