@@ -2255,7 +2255,7 @@ void theHistoryAnswerIsOnTheConsole()
 // ...AND A REFUSAL PUBLISHES NO SUCH LINE. A watch that settled on a refused
 // history would be a device run reporting the tab works because the wallet
 // mentioned it — the exact mistake #250 is about.
-void arefusedHistoryAnnouncesNoAnswer()
+void aRefusedHistoryAnnouncesNoAnswer()
 {
     const int before = failures;
     fake_door::reset();
@@ -2368,6 +2368,42 @@ void theAccountListIsOnTheConsole()
         pass("the account list is announced with the account the tabs will ask about");
 }
 
+// ...AND AN EMPTY KEYSTORE PUBLISHES NO ACCOUNT TO ASK ABOUT. A device opens
+// this app before any flow has imported anything, so this line is published
+// once for a list with nothing in it. `selected` is null there rather than an
+// empty string: an empty string is a reading, and a gate waiting for an account
+// would settle on the startup list and then press a button the view has
+// disabled. The count still says the keystore answered.
+void anEmptyKeystoreAnnouncesNoSelectedAccount()
+{
+    const int before = failures;
+    fake_door::reset();
+    announced.clear();
+    WalletUiWebBackend backend;
+
+    backend.refreshAccounts();
+    if (!expectCall(0, QStringLiteral("keystore_module"), QStringLiteral("list_accounts")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", true }, { "accounts", QJsonArray{} } });
+
+    const std::optional<QJsonObject> said = announcedObject(QStringLiteral("accounts now:"));
+    check(said.has_value(),
+          QStringLiteral("an empty account list was never announced: %1")
+              .arg(announced.join(QLatin1String(" | "))));
+    if (!said)
+        return;
+    check(said->value(QStringLiteral("count")).toInt() == 0,
+          QStringLiteral("the announced empty list did not say so: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+    check(said->value(QStringLiteral("selected")).isNull(),
+          QStringLiteral("an empty keystore announced a selected account a run would "
+                         "settle on: %1")
+              .arg(QString::fromUtf8(QJsonDocument(*said).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("an empty keystore announces its count and no account to ask about");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2417,10 +2453,11 @@ int main(int argc, char** argv)
     aMinedRevertIsReportedAsOne();
     aShieldWithAnUnencodableAmountIsRefusedWithoutAsking();
     theHistoryAnswerIsOnTheConsole();
-    arefusedHistoryAnnouncesNoAnswer();
+    aRefusedHistoryAnnouncesNoAnswer();
     theAppliedProxyIsOnTheConsole();
     aRefusedProxyAnnouncesNoApplication();
     theAccountListIsOnTheConsole();
+    anEmptyKeystoreAnnouncesNoSelectedAccount();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

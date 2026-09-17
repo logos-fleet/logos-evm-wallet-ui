@@ -606,9 +606,9 @@ bool WalletUiWebBackend::setProxyConfig(QString proxyJson)
             // answers a bare `true` and carries nothing to report.
             const QJsonObject asked =
                 QJsonDocument::fromJson(proxyJson.toUtf8()).object();
-            const QString applied =
-                proxyApplied(asked.value(QStringLiteral("proxy")).toString(),
-                             asked.value(QStringLiteral("proxyRequired")).toBool());
+            const QString url = asked.value(QStringLiteral("proxy")).toString();
+            const bool required = asked.value(QStringLiteral("proxyRequired")).toBool();
+            const QString applied = proxyApplied(url, required);
             // THE DOCUMENT, NOT THE SENTENCE (#250). The settings line is for
             // the person looking at the tab; this line is for the run that
             // drives the tab from inside the app, and a driver reads one JSON
@@ -616,10 +616,8 @@ bool WalletUiWebBackend::setProxyConfig(QString proxyJson)
             // console still says it in words.
             announce(QStringLiteral("proxy applied: %1")
                          .arg(jsonText(QJsonObject{
-                             { QStringLiteral("proxy"),
-                               asked.value(QStringLiteral("proxy")).toString() },
-                             { QStringLiteral("proxyRequired"),
-                               asked.value(QStringLiteral("proxyRequired")).toBool() },
+                             { QStringLiteral("proxy"), url },
+                             { QStringLiteral("proxyRequired"), required },
                              { QStringLiteral("by"), kWalletBackend },
                              { QStringLiteral("note"), applied } })));
             setProxyStatus(applied);
@@ -736,10 +734,20 @@ void WalletUiWebBackend::refreshAccounts()
             // does. `selected` is the account those tabs will ask about, which
             // is the reading that gate needs; the count is what tells an empty
             // keystore from one that answered.
+            //
+            // AND `selected` IS NULL WHEN THERE IS NO ACCOUNT, because a device
+            // opens this app with an empty keystore and publishes this line
+            // once for that list before a flow has imported anything. An empty
+            // STRING is a reading, and a gate that settled on it would open on
+            // the startup list and press a button the view has disabled; null
+            // is how the Shell's watcher already spells "not a reading".
+            const QString selected = selectedAccount();
             announce(QStringLiteral("accounts now: %1")
                          .arg(jsonText(QJsonObject{
                              { QStringLiteral("count"), static_cast<int>(accounts.size()) },
-                             { QStringLiteral("selected"), selectedAccount() },
+                             { QStringLiteral("selected"),
+                               selected.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                                  : QJsonValue(selected) },
                              { QStringLiteral("from"), kKeystore } })));
         });
 }
