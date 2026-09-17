@@ -699,6 +699,23 @@ void WalletUiWebBackend::takeCustodianRole(std::function<void()> then)
         });
 }
 
+void WalletUiWebBackend::nameAnApprover(std::function<void()> then,
+                                       std::function<void(const QString&)> refused)
+{
+    logos::web::callModuleAsync(
+        kKeystore, QStringLiteral("configure"), QJsonArray{ custodianRoles() },
+        [this, then, refused](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                refused(moduleRefused(kKeystore, QStringLiteral("configure"), res, reply));
+                return;
+            }
+            announce(QStringLiteral("approvers are now %1")
+                         .arg(jsonText(reply.value(QStringLiteral("approvers")).toArray())));
+            then();
+        });
+}
+
 // IMPORTING A SEED PHRASE IS THE KEYSTORE'S OWN METHOD, and this variant asks
 // for it exactly as it asks for a new account (#147).
 //
@@ -1694,6 +1711,11 @@ void WalletUiWebBackend::beginSendProve()
     setSendLeg(kLegProve, kStateRunning);
     setStatusText(QStringLiteral("Proving the private send…"));
     publishPrivateSend(kStateRunning);
+    // THE SEND'S APPROVAL IS LODGED BY railgun_module, NOT HERE, which is why
+    // this route does not name an approver the way the shield's does. The same
+    // session-scoped-roles finding applies to it (see nameAnApprover) and the
+    // fix belongs with whoever owns this route's legs -- noted on
+    // logos-workspace#245 rather than half-made here.
     logos::web::callModuleAsync(
         kRailgun, QStringLiteral("relayed_send"), QJsonArray{ jsonText(m_sendParams) },
         [this](const logos::web::ModuleCallResult& res) {
@@ -2332,6 +2354,18 @@ void WalletUiWebBackend::requestShieldApproval()
     setShieldLeg(kLegSign, kStateRunning);
     setStatusText(QStringLiteral("Waiting for approval in the Signer app"));
     publishPrivateShield(kStateRunning);
+    // THE ROLES FIRST, AND EVERY TIME. See nameAnApprover: the keystore's roles
+    // are session-scoped, so on any launch that did not itself create an account
+    // the approver is the built-in `evm_signer_ui` — a module this image does
+    // not carry — and this request would park for ever with nobody allowed to
+    // answer it. That is what kept `wrap` / `approve` / `shield` off a chain.
+    nameAnApprover([this, intent]() { lodgeShieldApproval(intent); },
+                   [this](const QString& why) { failShieldLeg(kLegSign, why); });
+}
+
+// ...and the ask itself, once an approver holds the role.
+void WalletUiWebBackend::lodgeShieldApproval(const QJsonObject& intent)
+{
     logos::web::callModuleAsync(
         kKeystore, QStringLiteral("request_approval"), QJsonArray{ jsonText(intent) },
         [this](const logos::web::ModuleCallResult& res) {

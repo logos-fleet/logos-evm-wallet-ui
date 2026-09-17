@@ -1448,7 +1448,25 @@ int planAShield(WalletUiWebBackend& backend, bool wrap = true)
     if (!expectCall(3, QStringLiteral("eth_rpc_module"), QStringLiteral("gas_price")))
         return -1;
     fake_door::answerJson(3, QJsonObject{ { "ok", true }, { "result", "0x3b9aca00" } });
-    return 4;
+
+    // ...AND AN APPROVER IS NAMED BEFORE ONE IS ASKED FOR (logos-workspace#245).
+    // The keystore's roles are session-scoped -- measured on an iPad Air 13-inch
+    // (M2) simulator, a restart left the imported ACCOUNT in idbfs and the ROLES
+    // back at `approvers ["evm_signer_ui"]` -- so a shield started on any launch
+    // that did not itself create an account would lodge a request no module in
+    // the image is allowed to answer, and park there for ever.
+    const std::optional<fake_door::Call> roles =
+        expectCall(4, QStringLiteral("keystore_module"), QStringLiteral("configure"));
+    if (!roles)
+        return -1;
+    check(roles->args.size() == 1
+              && roles->args.at(0).toString().contains(QStringLiteral("evm_signer_cli")),
+          QStringLiteral("the shield did not name an approver this image carries: %1")
+              .arg(describe(*roles)));
+    fake_door::answerJson(4, QJsonObject{ { "ok", true },
+                                          { "approvers",
+                                            QJsonArray{ "evm_signer_ui", "evm_signer_cli" } } });
+    return 5;
 }
 
 // Answer the approval request and the poll that follows it, and hand back the
