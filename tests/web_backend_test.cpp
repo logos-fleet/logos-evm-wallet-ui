@@ -1410,6 +1410,37 @@ bool approveAShield(int requestCall, int legs)
     return true;
 }
 
+// ── the route is named before it is walked ───────────────────────────────────
+//
+// #235's "the app has not hung" starts before anything is running: a page that
+// names the five legs it would take, from its first paint, has already told a
+// user what a shield consists of and that nothing has been started.
+void theShieldRouteIsPublishedFromTheFirstPaint()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    check(shieldState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("idle"),
+          QStringLiteral("a fresh page does not publish an idle shield: %1")
+              .arg(backend.privateShieldJson()));
+    const QJsonArray legs = shieldState(backend).value(QStringLiteral("legs")).toArray();
+    QStringList named;
+    for (const QJsonValue& v : legs)
+        named << v.toObject().value(QStringLiteral("name")).toString();
+    check(named == QStringList({ "plan", "sign", "wrap", "approve", "shield" }),
+          QStringLiteral("the route is not named in the order it is walked: %1")
+              .arg(named.join(QStringLiteral(", "))));
+    check(shieldState(backend).value(QStringLiteral("cancellable")).toBool() == false,
+          QStringLiteral("a shield nobody started offers a cancel: %1")
+              .arg(backend.privateShieldJson()));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("naming the route spent %1 call(s)").arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("the shield's route is named from the first paint, before anything is walked");
+}
+
 void aShieldNamesEveryLegItPutsOnChain()
 {
     const int before = failures;
@@ -1828,8 +1859,21 @@ void aShieldWithAnUnencodableAmountIsRefusedWithoutAsking()
           QStringLiteral("a refused shield still spent %1 call(s)")
               .arg(fake_door::calls.size()));
 
+    // ...AND THE PANEL THE USER IS LOOKING AT SAYS SO. Measured on an iPad Air
+    // 13-inch simulator: a device with no account in its keystore pressed
+    // `Shield`, the form had no `owner`, and `privateShieldJson` was never
+    // published — so the refusal existed only on the status line and the route
+    // panel was blank (logos-workspace#235).
+    check(shieldState(backend).value(QStringLiteral("error")).toString() == refused.value(QStringLiteral("error")).toString(),
+          QStringLiteral("the refusal did not reach the shield's own surface: %1")
+              .arg(backend.privateShieldJson()));
+    check(shieldLeg(backend, QStringLiteral("plan")) == QStringLiteral("pending"),
+          QStringLiteral("a refused shield did not lay its route out fresh: %1")
+              .arg(backend.privateShieldJson()));
+
     if (failures == before)
-        pass("an amount this wallet cannot encode is refused here, without a round trip");
+        pass("an amount this wallet cannot encode is refused here, without a round trip, "
+             "and the refusal reaches the panel the user is looking at");
 }
 
 } // namespace
@@ -1864,6 +1908,7 @@ int main(int argc, char** argv)
     aSendWithNoBundlerIsRefusedWithoutAsking();
     aSendJoinsAWalkAlreadyRunning();
     cancellingDuringTheSyncLegKeepsTheBlocks();
+    theShieldRouteIsPublishedFromTheFirstPaint();
     aShieldNamesEveryLegItPutsOnChain();
     aShieldWithoutAWrapSaysSkippedAndNotDone();
     cancellingWhileTheHumanDecidesTakesTheRequestBack();

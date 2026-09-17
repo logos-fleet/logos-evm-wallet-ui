@@ -251,6 +251,12 @@ WalletUiWebBackend::WalletUiWebBackend(QObject* parent)
     // ...and the same for the send: the route it would take, with nothing run.
     resetSendRoute();
     publishPrivateSend(kStateIdle, QStringLiteral("No private send has been started."));
+    // ...and for the shield, which is the route in the other direction. Both
+    // are published BEFORE anything can run, because the thing #235 is about is
+    // a user who cannot tell a working app from a hung one: a page that names
+    // its route from the first paint has already answered half of that.
+    resetShieldRoute();
+    publishPrivateShield(kStateIdle, QStringLiteral("No shield has been started."));
 
     // AUTOMATIC, AND ONLY AT THE EDGES. The view already picks the first
     // account as soon as one exists (WalletView.qml's `onCountChanged`), and it
@@ -2072,7 +2078,20 @@ QString WalletUiWebBackend::startPrivateShield(QString shieldJson)
     const QJsonObject params = QJsonDocument::fromJson(shieldJson.toUtf8()).object();
     const QString missing = missingShieldField(params);
     if (!missing.isEmpty()) {
+        // ON THE SURFACE AND NOT ONLY ON THE STATUS LINE. Measured on an iPad
+        // Air 13-inch simulator: a device with no account in its keystore
+        // pressed `Shield`, the form had no `owner`, and `privateShieldJson`
+        // was never published at all — so the one panel the user was looking at
+        // said nothing while the route had already been refused
+        // (logos-workspace#235).
         setStatusText(missing);
+        // The route is laid out fresh rather than left as the last run's: the
+        // refusal is about the shield the user is trying to start NOW, and an
+        // `idle` state over a route still showing `done` legs reads as neither.
+        m_shieldTxs = QJsonArray{};
+        m_shieldLeg.clear();
+        resetShieldRoute();
+        publishPrivateShield(kStateIdle, QString(), missing);
         return failed(missing);
     }
 
