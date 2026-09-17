@@ -336,6 +336,9 @@ private:
     QString buildShieldTxs();
     // Put the whole bundle in front of a human, once.
     void requestShieldApproval();
+    // The ask itself, split out of requestShieldApproval so the role document
+    // that has to be in force first reads as a step rather than a lambda.
+    void lodgeShieldApproval(const QJsonObject& intent);
     void pollShieldApproval();
     void collectShieldSignatures();
     // Hand the signed transactions to eth_rpc, in nonce order, without waiting
@@ -393,6 +396,25 @@ private:
     // claimCustody reads as the two questions it asks — "who am I here?" and
     // "may I mutate?" — rather than as two nested lambdas.
     void takeCustodianRole(std::function<void()> then);
+    // NAMING AN APPROVER, AND WHY IT HAPPENS WITH THE REQUEST rather than with
+    // the account (logos-workspace#245). `configure` is TOTAL and it is also
+    // SESSION-SCOPED: the roles live in the keystore's process and its vault
+    // does not carry them. Measured on an iPad Air 13-inch (M2) simulator: a
+    // launch that imported a seed left the ACCOUNT in idbfs — `list_accounts`
+    // answers it after a restart — and left the ROLES at their built-in
+    // defaults, `approvers ["evm_signer_ui"]`, `custodians ["evm_keystore_ui"]`.
+    // So the document sent while creating an account is gone by the next launch,
+    // and an approval lodged then is one no module in the image may answer.
+    //
+    // One ungated round trip, immediately before the ask, which is the only
+    // place that can be sure: the request about to be lodged is the one that
+    // needs an approver. It sends the SAME document `takeCustodianRole` sends —
+    // `configure` is total, so there is only one — and the two differ only in
+    // the role each reports and in how each says a refusal. `then` runs only
+    // when the roles are in force; a refusal goes to `refused` rather than to
+    // the status line, because the shield fails its own leg in its own words.
+    void nameAnApprover(std::function<void()> then,
+                        std::function<void(const QString&)> refused);
     // Announce and show a refused keystore call, in the two places every refusal
     // here goes, and report whether the caller should stop.
     bool keystoreRefused(const QString& method, const logos::web::ModuleCallResult& res,

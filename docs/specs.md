@@ -327,8 +327,15 @@ only kind this wallet can mint because it holds no seed.
   1. `keystore_module.configure(rolesJson)` — creating an account belongs to the
      **custodian**, whose built-in default `evm_keystore_ui` does not exist in this
      workspace. `configure` is TOTAL, so the document names the full set:
-     `{"approvers": "evm_signer_ui", "custodians": ["evm_keystore_ui", "wallet_ui"]}` —
-     adding this module rather than replacing the defaults.
+     `{"approvers": ["evm_signer_ui", "evm_signer_cli"], "custodians": ["evm_keystore_ui",
+     "wallet_ui"]}` — adding to the defaults rather than replacing them.
+
+     The **approver** set names two (logos-workspace#245). `evm_signer_ui` is the desktop
+     Signer app and is not in this workspace; `evm_signer_cli` is the headless approver,
+     which holds the same role under the same gate — it re-claims the request, checks the
+     bundle id and takes the vault password — and answers over method calls instead of a
+     window. Until it was named here the role on a phone was held by a module that could
+     never answer, so every `request_approval` this wallet made parked at `sign` for ever.
   2. `keystore_module.create_unrelated_account({passphrase, acknowledgeUnrecoverable: true})`
      — the keystore refuses to mint an unrecoverable key unless the caller acknowledges it,
      and the New-account dialog *is* that acknowledgement.

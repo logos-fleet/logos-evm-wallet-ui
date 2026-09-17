@@ -42,10 +42,18 @@ bool replyOk(const QString& replyJson)
 // all this adds. The `web` variant sends the same document; the two are
 // separate images with no shared translation unit, so they must stay in step by
 // hand.
-QString custodianRoles()
+//
+// AND WHY THE APPROVER SET HAS TWO NAMES (logos-workspace#245). The built-in
+// approver `evm_signer_ui` is the desktop Signer app; `evm_signer_cli` is the
+// headless one, which holds the same role under the same gate and answers over
+// method calls instead of a window. A desktop that has the Signer app keeps it
+// — this is an addition — and an image that has only the CLI can still approve.
+QString keystoreRoles()
 {
     QJsonObject roles;
-    roles.insert(QStringLiteral("approvers"), QStringLiteral("evm_signer_ui"));
+    roles.insert(QStringLiteral("approvers"),
+                 QJsonArray{ QStringLiteral("evm_signer_ui"),
+                             QStringLiteral("evm_signer_cli") });
     roles.insert(QStringLiteral("custodians"),
                  QJsonArray{ QStringLiteral("evm_keystore_ui"), QStringLiteral("wallet_ui") });
     return jsonText(roles);
@@ -125,7 +133,7 @@ QString WalletUiBackend::createAccount(QString passphrase, QString label)
     //
     // TAKE THE ROLE, THEN MUTATE: the mutation is refused until the role is in
     // force, so a refusal here is reported instead of asking for the account.
-    const QString configured = modules().keystore_module.configure(custodianRoles());
+    const QString configured = modules().keystore_module.configure(keystoreRoles());
     if (!replyOk(configured)) {
         setStatusText(QStringLiteral("keystore_module refused configure"));
         return configured;
