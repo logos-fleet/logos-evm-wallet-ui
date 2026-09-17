@@ -76,11 +76,12 @@ Item {
         catch (e) { return fallback }
     }
 
-    // The colour the Private tab reads a sync state in. A function rather than a
-    // chain of ternaries in the binding: the states are a closed set (see the
-    // `kState*` constants in wallet_ui_web_backend.cpp), and this is where the
-    // set is matched, one line each.
-    function privateSyncColor(state) {
+    // The colour the Private tab reads a state in — the walk's, the send's, and
+    // each of the send's legs, because they are deliberately one vocabulary
+    // (see the `kState*` constants in wallet_ui_web_backend.cpp). A function
+    // rather than a chain of ternaries in the binding: the set is closed, and
+    // this is where it is matched, one line each.
+    function privateStateColor(state) {
         if (state === "unavailable" || state === "failed") return Theme.palette.error
         if (state === "done") return Theme.palette.success
         if (state === "running") return Theme.palette.warning
@@ -584,7 +585,7 @@ Item {
                             objectName: "privateSyncState"
                             Layout.fillWidth: true
                             text: root.privateSync.state || "unknown"
-                            color: root.privateSyncColor(root.privateSync.state)
+                            color: root.privateStateColor(root.privateSync.state)
                         }
                     }
 
@@ -682,15 +683,12 @@ Item {
                     LogosTextField { id: privMemo; objectName: "privateSendMemoField"; Layout.fillWidth: true; placeholderText: "Memo (optional)" }
                     LogosTextField { id: privBundler; objectName: "privateSendBundlerField"; Layout.fillWidth: true; placeholderText: "Bundler URL (ERC-4337, https://…)" }
 
-                    RowLayout {
+                    LogosText {
+                        objectName: "privateSendState"
                         Layout.fillWidth: true
-                        LogosText {
-                            objectName: "privateSendState"
-                            Layout.fillWidth: true
-                            text: "send: " + (root.privateSend.state || "idle")
-                                  + (root.privateSend.leg ? "  ·  " + root.privateSend.leg : "")
-                            color: root.privateSyncColor(root.privateSend.state)
-                        }
+                        text: "send: " + (root.privateSend.state || "idle")
+                              + (root.privateSend.leg ? "  ·  " + root.privateSend.leg : "")
+                        color: root.privateStateColor(root.privateSend.state)
                     }
 
                     // THE ROUTE. One row per leg, in the order it is walked.
@@ -703,7 +701,7 @@ Item {
                             LogosText {
                                 Layout.fillWidth: true
                                 font.pixelSize: Theme.typography.secondaryText
-                                color: root.privateSyncColor(modelData.state)
+                                color: root.privateStateColor(modelData.state)
                                 text: root.privateSendLegLine(index, modelData)
                             }
                         }

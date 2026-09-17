@@ -187,7 +187,7 @@ private:
     // stalled, refused or cancelled) and cleared before it runs, so the two
     // paths that can end a walk at the same moment — the cancel's own reply and
     // the window that was already in flight — cannot both carry the send on.
-    std::function<void(bool, QString)> m_syncThen;
+    std::function<void(bool, const QString&)> m_syncThen;
     // The last plan `railgun_module` answered with, kept so a cancel can report
     // the block the walk reached without asking for it a second time.
     QJsonObject m_syncPlan;
@@ -256,6 +256,9 @@ private:
     // so the broadcast leg is reported by its RESULT and never as running —
     // this side cannot see it start.
     void pollSendApproval();
+    // A leg that could not go on: the console, the status line, the leg and the
+    // send all say the same thing, which is why they are said in one place.
+    void failSendLeg(const QString& leg, const QString& why);
     // Take the approval request out of the Signer's queue and end the send.
     void withdrawSendRequest();
     void publishPrivateSend(const QString& state, const QString& note = QString(),

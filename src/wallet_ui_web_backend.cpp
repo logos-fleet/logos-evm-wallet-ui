@@ -1372,9 +1372,10 @@ QString WalletUiWebBackend::cancelPrivateSync()
                 reply.contains(QStringLiteral("keptToBlock"))
                     ? reply.value(QStringLiteral("keptToBlock")).toVariant().toLongLong()
                     : reply.value(QStringLiteral("syncedBlock")).toVariant().toLongLong();
+            const QString note = cancelNote(kept);
             setStatusText(QStringLiteral("Private sync stopped"));
-            publishPrivateSync(kStateCancelled, reply, cancelNote(kept));
-            syncLegEnded(false, cancelNote(kept));
+            publishPrivateSync(kStateCancelled, reply, note);
+            syncLegEnded(false, note);
         });
     return accepted();
 }
@@ -1391,7 +1392,7 @@ void WalletUiWebBackend::syncLegEnded(bool ok, const QString& why)
 {
     if (!m_syncThen)
         return;
-    const std::function<void(bool, QString)> then = m_syncThen;
+    const std::function<void(bool, const QString&)> then = m_syncThen;
     m_syncThen = nullptr;
     then(ok, why);
 }
@@ -1488,6 +1489,14 @@ const QString kCancelledBeforeSigning = QStringLiteral(
 const QString kAlreadyBroadcast = QStringLiteral(
     "This private send has already been broadcast: the operation is the chain's now and "
     "cannot be recalled.");
+
+// "railgun_module refused relayed_send: …" — the one sentence a refusal on this
+// route is said in, written once so every leg names the method it asked for.
+QString railgunRefused(const QString& method, const logos::web::ModuleCallResult& res,
+                       const QJsonObject& reply)
+{
+    return QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, refusalReason(res, reply));
+}
 
 // What a send needs before this variant will spend a round trip on it, in the
 // order a user fills them in. Same rule the custom-token field follows: what
@@ -1598,15 +1607,21 @@ QString WalletUiWebBackend::startPrivateSend(QString sendJson)
 
     setSendLeg(kLegSync, kStateRunning);
     m_syncThen = [this](bool ok, const QString& why) {
-        if (!ok) {
-            const bool left = m_sendCancelled;
-            setSendLeg(kLegSync, left ? kStateCancelled : kStateFailed);
-            finishSend(left ? kStateCancelled : kStateFailed, left ? why : QString(),
-                       left ? QString() : why);
+        if (ok) {
+            setSendLeg(kLegSync, kStateDone);
+            beginSendProve();
             return;
         }
-        setSendLeg(kLegSync, kStateDone);
-        beginSendProve();
+        // A WALK THAT DID NOT FINISH ends the send where it stands, and `why`
+        // is filed under the heading it belongs to: what the user chose is a
+        // `note`, what went wrong is an `error`.
+        if (m_sendCancelled) {
+            setSendLeg(kLegSync, kStateCancelled);
+            finishSend(kStateCancelled, why);
+        } else {
+            setSendLeg(kLegSync, kStateFailed);
+            finishSend(kStateFailed, QString(), why);
+        }
     };
     publishPrivateSend(kStateRunning);
 
@@ -1640,12 +1655,8 @@ void WalletUiWebBackend::beginSendProve()
         [this](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
-                const QString why = QStringLiteral("%1 refused relayed_send: %2")
-                                        .arg(kRailgun, refusalReason(res, reply));
-                announce(why);
-                setStatusText(why);
-                setSendLeg(kLegProve, kStateFailed);
-                finishSend(kStateFailed, QString(), why);
+                failSendLeg(kLegProve,
+                            railgunRefused(QStringLiteral("relayed_send"), res, reply));
                 return;
             }
             m_sendRequestId = reply.value(QStringLiteral("requestId")).toString();
@@ -1678,12 +1689,8 @@ void WalletUiWebBackend::pollSendApproval()
         [this](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
-                const QString why = QStringLiteral("%1 refused relayed_send_status: %2")
-                                        .arg(kRailgun, refusalReason(res, reply));
-                announce(why);
-                setStatusText(why);
-                setSendLeg(kLegApprove, kStateFailed);
-                finishSend(kStateFailed, QString(), why);
+                failSendLeg(kLegApprove,
+                            railgunRefused(QStringLiteral("relayed_send_status"), res, reply));
                 return;
             }
             const QString state = reply.value(QStringLiteral("state")).toString();
@@ -1701,21 +1708,16 @@ void WalletUiWebBackend::pollSendApproval()
                 // person, or the keystore's sweep, said no. Nothing was
                 // broadcast and nothing was spent.
                 const QString reason = reply.value(QStringLiteral("reason")).toString();
-                setSendLeg(kLegApprove, kStateFailed);
-                const QString why =
-                    QStringLiteral("The Signer app did not approve this send: %1")
-                        .arg(reason.isEmpty() ? QStringLiteral("declined") : reason);
-                setStatusText(why);
-                finishSend(kStateFailed, QString(), why);
+                failSendLeg(kLegApprove,
+                            QStringLiteral("The Signer app did not approve this send: %1")
+                                .arg(reason.isEmpty() ? QStringLiteral("declined") : reason));
                 return;
             }
             if (state != QStringLiteral("awaiting_approval")) {
-                const QString why =
+                failSendLeg(
+                    kLegApprove,
                     QStringLiteral("%1 answered an approval state this wallet does not know: %2")
-                        .arg(kRailgun, state);
-                announce(why);
-                setSendLeg(kLegApprove, kStateFailed);
-                finishSend(kStateFailed, QString(), why);
+                        .arg(kRailgun, state));
                 return;
             }
             if (m_sendCancelled) {
@@ -1733,6 +1735,19 @@ void WalletUiWebBackend::pollSendApproval()
         });
 }
 
+// A LEG THAT COULD NOT GO ON, said the same way wherever it happens: on the
+// page's console, on the status line, on the leg itself and on the send. Four
+// things had drifted apart across the route's failure paths — an unknown
+// approval state left the status line reading "Waiting for approval" for a send
+// that had already ended — so they are done here, together, once.
+void WalletUiWebBackend::failSendLeg(const QString& leg, const QString& why)
+{
+    announce(why);
+    setStatusText(why);
+    setSendLeg(leg, kStateFailed);
+    finishSend(kStateFailed, QString(), why);
+}
+
 void WalletUiWebBackend::withdrawSendRequest()
 {
     logos::web::callModuleAsync(
@@ -1745,8 +1760,8 @@ void WalletUiWebBackend::withdrawSendRequest()
                 // leaves a request in the approver's queue, which the keystore
                 // sweeps on its own — so the outcome for the user is the same
                 // and the difference is said rather than hidden.
-                const QString why = QStringLiteral("%1 refused relayed_send_cancel: %2")
-                                        .arg(kRailgun, refusalReason(res, reply));
+                const QString why =
+                    railgunRefused(QStringLiteral("relayed_send_cancel"), res, reply);
                 announce(why);
                 finishSend(kStateCancelled, kCancelledBeforeSigning, why);
                 return;
@@ -1798,8 +1813,8 @@ void WalletUiWebBackend::publishPrivateSend(const QString& state, const QString&
     send.insert(QStringLiteral("leg"), m_sendLeg);
     send.insert(QStringLiteral("legs"), m_sendLegs);
     // WHETHER THE BUTTON SHOULD BE THERE, decided here rather than by a view
-    // reading five states and guessing. A broadcast send is the one that is
-    // over and cannot be taken back.
+    // reading five states and guessing: a send in flight can be left, and one
+    // that has ended — broadcast, declined, cancelled or never started — cannot.
     send.insert(QStringLiteral("cancellable"), m_sendRunning);
     if (!m_sendRequestId.isEmpty())
         send.insert(QStringLiteral("requestId"), m_sendRequestId);
