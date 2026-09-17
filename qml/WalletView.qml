@@ -61,6 +61,10 @@ Item {
     // The one leg of a private send that reports progress. See the Private tab
     // below, and `privateSyncJson` in wallet_ui.rep for the shape.
     readonly property var privateSync: parseField(backend ? backend.privateSyncJson : "", "sync", ({}))
+    // The send that leg belongs to: `{ state, leg, legs: [{name, state}], … }`.
+    // See `privateSendJson` in wallet_ui.rep.
+    readonly property var privateSend: parseField(backend ? backend.privateSendJson : "", "send", ({}))
+    readonly property var privateSendLegs: privateSend.legs || []
     // Where Private sits in the tab bar. Named because selectTab, the tab bar
     // and docs/specs.md all have to quote the same number — see the tab bar
     // below for why it is APPENDED rather than placed next to Send.
@@ -72,15 +76,37 @@ Item {
         catch (e) { return fallback }
     }
 
-    // The colour the Private tab reads a sync state in. A function rather than a
-    // chain of ternaries in the binding: the states are a closed set (see the
-    // `kState*` constants in wallet_ui_web_backend.cpp), and this is where the
-    // set is matched, one line each.
-    function privateSyncColor(state) {
-        if (state === "unavailable") return Theme.palette.error
+    // The colour the Private tab reads a state in — the walk's, the send's, and
+    // each of the send's legs, because they are deliberately one vocabulary
+    // (see the `kState*` constants in wallet_ui_web_backend.cpp). A function
+    // rather than a chain of ternaries in the binding: the set is closed, and
+    // this is where it is matched, one line each.
+    function privateStateColor(state) {
+        if (state === "unavailable" || state === "failed") return Theme.palette.error
         if (state === "done") return Theme.palette.success
         if (state === "running") return Theme.palette.warning
         return Theme.palette.textSecondary
+    }
+
+    // "2 · prove — running". One line per leg of a send, so the route is
+    // readable as a whole and a leg that was SKIPPED is visibly not a leg that
+    // was run. Built here rather than in the delegate for the same reason
+    // `privateSyncProgressLine` is: the delegate should bind, not compute.
+    function privateSendLegLine(index, leg) {
+        return (index + 1) + " · " + leg.name + " — " + leg.state
+    }
+
+    // What the Private tab's send form hands the backend. `owner` is the
+    // selected account: the EOA whose signature authorises the relayed
+    // operation, which is the only thing this send needs a public account for
+    // — it pays no gas.
+    function buildPrivateSend() {
+        return JSON.stringify({ to: privToAddr.text,
+                                asset: privAsset.text,
+                                amount: privAmount.text,
+                                memo: privMemo.text,
+                                owner: acctBox.currentText,
+                                bundlerUrl: privBundler.text })
     }
 
     // "40%  ·  600 blocks to go  ·  about 6 s left" — joined from the parts that
@@ -506,7 +532,7 @@ Item {
                 }
             }
 
-            // ── 7 · Private (RAILGUN) — the sync a private send waits on ──
+            // ── 7 · Private (RAILGUN) — a private send, and the walk in front of it ──
             //
             // WHY A TAB FOR ONE NUMBER. A RAILGUN private send measured ~154 s on
             // a simulator and 239 s on a physical iPad, and ~92 % of that is the
@@ -517,13 +543,17 @@ Item {
             // running, how far it has got, what it has left to do, and a control
             // that stops it.
             //
-            // IT IS NOT A SEND. There is no private-send flow in this wallet yet;
-            // what exists is the module's API and the long leg in front of it. So
-            // the page shows the leg, states plainly that it is the one a send
-            // waits on, and lets a user get it out of the way BEFORE they need it
-            // — which is the answer this view gives to "should the sync run in
-            // the background": the distance is read automatically and costs one
-            // RPC, the walk is asked for and then runs on its own.
+            // TWO HALVES, IN THE ORDER THEY MATTER. The top is the walk on its
+            // own — because it is the long leg and a user should be able to get
+            // it out of the way BEFORE they need it. Below it is the send, whose
+            // route begins with that same walk: start a send while behind and
+            // the walk is its first leg, start one level and the leg is skipped.
+            //
+            // That split is this view's answer to "should the sync run in the
+            // background": the DISTANCE is read automatically and costs one RPC,
+            // so the page can always say how far behind the device is; the WALK
+            // is started by the thing that needs it, which is a send, or by a
+            // user who would rather wait now than later.
             LogosScrollView {
                 clip: true
                 ColumnLayout {
@@ -540,9 +570,10 @@ Item {
                     }
 
                     // WHICH LEG IS RUNNING, in so many words. `sync` is the only
-                    // leg that reports progress today; the rest of a send (wrap /
-                    // approve / shield / prove / broadcast) are short calls with
-                    // no window to show, and this line does not pretend otherwise.
+                    // leg with a PERCENTAGE — it walks a known number of blocks —
+                    // so the bar below belongs to it alone; the send's other legs
+                    // are named and timed in the route further down rather than
+                    // given a bar that would be a guess.
                     RowLayout {
                         Layout.fillWidth: true
                         LogosText {
@@ -554,7 +585,7 @@ Item {
                             objectName: "privateSyncState"
                             Layout.fillWidth: true
                             text: root.privateSync.state || "unknown"
-                            color: root.privateSyncColor(root.privateSync.state)
+                            color: root.privateStateColor(root.privateSync.state)
                         }
                     }
 
@@ -615,6 +646,101 @@ Item {
                             text: "Cancel"
                             enabled: root.ready && root.privateSync.state === "running"
                             onClicked: logos.watch(backend.cancelPrivateSync(),
+                                                   function (r) {}, function (e) {})
+                        }
+                    }
+
+                    // ── the send the walk above is a leg of ──────────────
+                    //
+                    // #235 clause 1: "which leg is running (wrap / approve /
+                    // shield / sync / prove / broadcast) and that the app has
+                    // not hung". The route is shown WHOLE — every leg with its
+                    // own state — because a user who has been waiting two
+                    // minutes wants to know what is left as much as what is
+                    // happening, and because a leg marked `skipped` is a
+                    // different claim from one marked `done`.
+                    //
+                    // FOUR LEGS AND NOT SIX. `wrap` / `approve` / `shield` put
+                    // funds INTO the shielded pool and end in public
+                    // transactions this build cannot sign (the coordinator owns
+                    // sends and has no mobile build). This is the send of funds
+                    // that are already shielded: walk the tree, prove, have a
+                    // human approve, submit. The page names its own legs and
+                    // invents none.
+                    LogosText {
+                        Layout.topMargin: Theme.spacing.medium
+                        text: "Send privately"; font.weight: Theme.typography.weightBold
+                    }
+                    LogosText {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        text: "Spends a balance that is already shielded. The selected account " +
+                              "signs the relayed operation in the Signer app and pays no gas."
+                    }
+                    LogosTextField { id: privToAddr; objectName: "privateSendToField"; Layout.fillWidth: true; placeholderText: "Recipient (0zk… private, or 0x… to unshield)" }
+                    LogosTextField { id: privAsset; objectName: "privateSendAssetField"; Layout.fillWidth: true; placeholderText: "Asset (ERC-20 address, 0x…)" }
+                    LogosTextField { id: privAmount; objectName: "privateSendAmountField"; Layout.fillWidth: true; placeholderText: "Amount (base units)" }
+                    LogosTextField { id: privMemo; objectName: "privateSendMemoField"; Layout.fillWidth: true; placeholderText: "Memo (optional)" }
+                    LogosTextField { id: privBundler; objectName: "privateSendBundlerField"; Layout.fillWidth: true; placeholderText: "Bundler URL (ERC-4337, https://…)" }
+
+                    LogosText {
+                        objectName: "privateSendState"
+                        Layout.fillWidth: true
+                        text: "send: " + (root.privateSend.state || "idle")
+                              + (root.privateSend.leg ? "  ·  " + root.privateSend.leg : "")
+                        color: root.privateStateColor(root.privateSend.state)
+                    }
+
+                    // THE ROUTE. One row per leg, in the order it is walked.
+                    ColumnLayout {
+                        objectName: "privateSendLegs"
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Repeater {
+                            model: root.privateSendLegs
+                            LogosText {
+                                Layout.fillWidth: true
+                                font.pixelSize: Theme.typography.secondaryText
+                                color: root.privateStateColor(modelData.state)
+                                text: root.privateSendLegLine(index, modelData)
+                            }
+                        }
+                    }
+
+                    LogosText {
+                        objectName: "privateSendNote"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.textTertiary
+                        visible: text.length > 0
+                        text: root.privateSend.note || ""
+                    }
+                    LogosText {
+                        objectName: "privateSendError"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.typography.secondaryText; color: Theme.palette.error
+                        visible: text.length > 0
+                        text: root.privateSend.error || ""
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        LogosButton {
+                            objectName: "privateSendButton"
+                            text: "Send privately"
+                            enabled: root.ready && root.privateSend.state !== "running"
+                            onClicked: logos.watch(backend.startPrivateSend(root.buildPrivateSend()),
+                                                   function (r) {}, function (e) {})
+                        }
+                        // LEAVING IS DIFFERENT AT EACH LEG, and the backend is
+                        // the one that knows which: `cancellable` is false once
+                        // the operation has been broadcast, which is the one
+                        // point where there is nothing to stop. The note that
+                        // lands says what the cancel did and did not undo.
+                        LogosButton {
+                            objectName: "privateSendCancelButton"
+                            text: "Cancel send"
+                            enabled: root.ready && root.privateSend.cancellable === true
+                            onClicked: logos.watch(backend.cancelPrivateSend(),
                                                    function (r) {}, function (e) {})
                         }
                     }

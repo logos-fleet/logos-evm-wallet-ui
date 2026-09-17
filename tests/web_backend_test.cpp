@@ -840,6 +840,453 @@ void theRetryIsBoundedAndTheLastRefusalIsPublished()
         pass("the admission retry gives up, and the last refusal names the module");
 }
 
+
+// ── a private SEND, leg by leg ───────────────────────────────────────────────
+//
+// logos-workspace#235 clause 1: "which leg is running (wrap / approve / shield /
+// sync / prove / broadcast) and that the app has not hung". The sync above is
+// the long leg; this is the send it is a leg OF, and what is asserted is that
+// every leg is named as it runs, that a leg is only marked done by a reply that
+// landed, and that the route is one call at a time so there is always exactly
+// one thing to cancel.
+QJsonObject sendState(const WalletUiWebBackend& backend)
+{
+    return parse(backend.privateSendJson()).value(QStringLiteral("send")).toObject();
+}
+
+// The state of one named leg in the `legs` array, or "" if the route does not
+// carry it. A view renders the whole route, so a drive asserts on the whole
+// route rather than on `leg` alone.
+QString legState(const WalletUiWebBackend& backend, const QString& name)
+{
+    const QJsonArray legs = sendState(backend).value(QStringLiteral("legs")).toArray();
+    for (const QJsonValue& v : legs) {
+        const QJsonObject leg = v.toObject();
+        if (leg.value(QStringLiteral("name")).toString() == name)
+            return leg.value(QStringLiteral("state")).toString();
+    }
+    return QString();
+}
+
+QString sendJson(const QString& to = QStringLiteral("0zk1qyxj0wxcpfdzq4sxa34vqx7kmzuxka34n4xdcxf9"))
+{
+    return QString::fromUtf8(
+        QJsonDocument(
+            QJsonObject{ { "to", to },
+                         { "asset", "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14" },
+                         { "amount", "1000000000000000" },
+                         { "memo", "" },
+                         { "owner", "0x493A0000000000000000000000000000000dDEEa" },
+                         { "bundlerUrl", "https://bundler.example/rpc" } })
+            .toJson(QJsonDocument::Compact));
+}
+
+// `sync_status` for a device that is behind the head, which is the state a
+// wallet is in before it has ever walked.
+QJsonObject behindReply()
+{
+    QJsonObject r = planReply(0, 11720000, false);
+    r.insert(QStringLiteral("running"), false);
+    return r;
+}
+
+void aPrivateSendNamesEveryLegItRuns()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    // The wallet already knows the distance — one eth_blockNumber, taken
+    // automatically. It has walked nothing.
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, behindReply());
+
+    const QJsonObject taken = parse(backend.startPrivateSend(sendJson()));
+    check(taken.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("startPrivateSend did not take the ask: %1")
+              .arg(QString::fromUtf8(QJsonDocument(taken).toJson(QJsonDocument::Compact))));
+
+    // LEG 1 — sync. THE SEND STARTS THE WALK (#235 clause 4): the distance is
+    // read for free and automatically, the walk happens when something needs
+    // the tree.
+    check(sendState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("sync"),
+          QStringLiteral("a send that is behind did not start on the sync leg: %1")
+              .arg(backend.privateSendJson()));
+    check(legState(backend, QStringLiteral("sync")) == QStringLiteral("running"),
+          QStringLiteral("the sync leg is not running: %1").arg(backend.privateSendJson()));
+    check(legState(backend, QStringLiteral("prove")) == QStringLiteral("pending"),
+          QStringLiteral("a later leg is not pending: %1").arg(backend.privateSendJson()));
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+    fake_door::answerJson(1, planReply(100, 11721000, true));
+
+    // LEG 2 — prove. One `relayed_send`, and its params are one JSON STRING
+    // like every other rust-first method on this wire.
+    const std::optional<fake_door::Call> prove =
+        expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("relayed_send"));
+    if (!prove)
+        return;
+    check(prove->args.size() == 1 && prove->args.at(0).isString(),
+          QStringLiteral("relayed_send was not given its params as one JSON string: %1")
+              .arg(describe(*prove)));
+    const QJsonObject params = parse(prove->args.isEmpty() ? QString()
+                                                           : prove->args.at(0).toString());
+    check(params.value(QStringLiteral("bundlerUrl")).toString()
+              == QStringLiteral("https://bundler.example/rpc"),
+          QStringLiteral("the bundler the caller named did not reach the module: %1")
+              .arg(describe(*prove)));
+    check(legState(backend, QStringLiteral("sync")) == QStringLiteral("done"),
+          QStringLiteral("the sync leg is not done once the walk finished: %1")
+              .arg(backend.privateSendJson()));
+    check(sendState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("prove"),
+          QStringLiteral("the running leg is not the proof: %1").arg(backend.privateSendJson()));
+    fake_door::answerJson(2, QJsonObject{ { "ok", true },
+                                          { "pending", true },
+                                          { "requestId", "handle-1" } });
+
+    // LEG 3 — approve. The request is lodged; a human answers it in the Signer
+    // app, and the wallet polls for that answer.
+    const std::optional<fake_door::Call> poll =
+        expectCall(3, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_status"));
+    if (!poll)
+        return;
+    check(poll->args.size() == 1 && poll->args.at(0).toString() == QStringLiteral("handle-1"),
+          QStringLiteral("the status poll did not carry the request id: %1").arg(describe(*poll)));
+    check(sendState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("approve"),
+          QStringLiteral("the running leg is not the approval: %1").arg(backend.privateSendJson()));
+    check(legState(backend, QStringLiteral("prove")) == QStringLiteral("done"),
+          QStringLiteral("the proof leg is not done: %1").arg(backend.privateSendJson()));
+    fake_door::answerJson(3, QJsonObject{ { "ok", true }, { "state", "awaiting_approval" } });
+
+    // ...and it is polled AGAIN, on a timer, because a human takes wall time.
+    settleUntilCall(4, 5000);
+    if (!expectCall(4, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_status")))
+        return;
+    fake_door::answerJson(4, QJsonObject{ { "ok", true },
+                                          { "state", "done" },
+                                          { "userOpHash", "0xfeed" } });
+
+    // LEG 4 — broadcast. The poll that answered `done` is the one that
+    // submitted the operation to the bundler, so the leg is reported by its
+    // result and never as "running": the wallet cannot see it start.
+    check(sendState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("done"),
+          QStringLiteral("a submitted send is not done: %1").arg(backend.privateSendJson()));
+    check(legState(backend, QStringLiteral("broadcast")) == QStringLiteral("done"),
+          QStringLiteral("the broadcast leg is not done: %1").arg(backend.privateSendJson()));
+    check(sendState(backend).value(QStringLiteral("userOpHash")).toString()
+              == QStringLiteral("0xfeed"),
+          QStringLiteral("the operation hash did not reach the view: %1")
+              .arg(backend.privateSendJson()));
+
+    if (failures == before)
+        pass("a private send names every leg it runs, and each one ends on a reply that landed");
+}
+
+// ── a tree already at the head is not walked again ───────────────────────────
+//
+// The other half of #235 clause 4. `sync_status` is one RPC and is taken
+// automatically, so the wallet already knows it is level — and a send that
+// walked anyway would spend minutes of radio for nothing. The leg is SKIPPED,
+// which is a different word from `done` on purpose: a view that showed "synced"
+// for a walk it never made would be claiming work it did not do.
+void aSendOnASyncedTreeSkipsTheWalk()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, planReply(100, 11721000, true));
+
+    backend.startPrivateSend(sendJson());
+
+    // Straight to the proof: no `sync_step` was ever asked for.
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("relayed_send")))
+        return;
+    check(legState(backend, QStringLiteral("sync")) == QStringLiteral("skipped"),
+          QStringLiteral("a level tree was not reported as skipped: %1")
+              .arg(backend.privateSendJson()));
+    check(sendState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("prove"),
+          QStringLiteral("a level tree did not go straight to the proof: %1")
+              .arg(backend.privateSendJson()));
+
+    if (failures == before)
+        pass("a send on a tree that is already at the head skips the walk and says so");
+}
+
+// ── leaving, and what leaving costs at each leg ──────────────────────────────
+//
+// #235 clause 2 for the whole send rather than for the sync alone. The route is
+// one call at a time, so there is always exactly one thing in flight and
+// "cancel" means something different — and states something different — at each
+// leg. Here: during the approval, where a request is sitting in a human's queue
+// and NOTHING has been signed or broadcast.
+void cancellingDuringTheApprovalWithdrawsTheRequest()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, planReply(100, 11721000, true));
+    backend.startPrivateSend(sendJson());
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("relayed_send")))
+        return;
+    fake_door::answerJson(1, QJsonObject{ { "ok", true },
+                                          { "pending", true },
+                                          { "requestId", "handle-1" } });
+    if (!expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_status")))
+        return;
+    fake_door::answerJson(2, QJsonObject{ { "ok", true }, { "state", "awaiting_approval" } });
+
+    const QJsonObject taken = parse(backend.cancelPrivateSend());
+    check(taken.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a cancel during the approval was refused: %1")
+              .arg(QString::fromUtf8(QJsonDocument(taken).toJson(QJsonDocument::Compact))));
+
+    // THE REQUEST IS WITHDRAWN, by id: a request nobody withdraws sits in the
+    // approver's queue until the keystore sweeps it, and the user who left is
+    // the one who would be asked about it.
+    const std::optional<fake_door::Call> withdrawn =
+        expectCall(3, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_cancel"));
+    if (!withdrawn)
+        return;
+    check(withdrawn->args.size() == 1
+              && withdrawn->args.at(0).toString() == QStringLiteral("handle-1"),
+          QStringLiteral("the withdrawal did not name the request: %1").arg(describe(*withdrawn)));
+    fake_door::answerJson(3, QJsonObject{ { "ok", true } });
+
+    check(sendState(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("cancelled"),
+          QStringLiteral("the send does not report the cancel: %1").arg(backend.privateSendJson()));
+    const QString note = sendState(backend).value(QStringLiteral("note")).toString();
+    check(note.contains(QStringLiteral("nothing"), Qt::CaseInsensitive)
+              && note.contains(QStringLiteral("broadcast")),
+          QStringLiteral("the note does not say that nothing was broadcast: %1").arg(note));
+
+    // ...AND THE POLL STOPS. A timer that kept asking about a request that has
+    // been withdrawn would answer "unknown request" for the life of the page.
+    const int after = fake_door::calls.size();
+    settleUntilCall(after, 3000);
+    check(fake_door::calls.size() == after,
+          QStringLiteral("the approval was still polled after the cancel: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a cancel during the approval withdraws the request, and nothing was broadcast");
+}
+
+// ── a broadcast send is the chain's ──────────────────────────────────────────
+//
+// The one leg where "cancel" has no meaning, and the surface says so rather
+// than offering a button that quietly does nothing.
+void aBroadcastSendCannotBeRecalled()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, planReply(100, 11721000, true));
+    backend.startPrivateSend(sendJson());
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("relayed_send")))
+        return;
+    fake_door::answerJson(1, QJsonObject{ { "ok", true },
+                                          { "pending", true },
+                                          { "requestId", "handle-1" } });
+    if (!expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_status")))
+        return;
+    fake_door::answerJson(2, QJsonObject{ { "ok", true },
+                                          { "state", "done" },
+                                          { "userOpHash", "0xfeed" } });
+
+    const int after = fake_door::calls.size();
+    const QJsonObject refused = parse(backend.cancelPrivateSend());
+    check(!refused.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a broadcast send accepted a cancel: %1")
+              .arg(QString::fromUtf8(QJsonDocument(refused).toJson(QJsonDocument::Compact))));
+    check(refused.value(QStringLiteral("error")).toString().contains(QStringLiteral("broadcast")),
+          QStringLiteral("the refusal does not say why: %1")
+              .arg(refused.value(QStringLiteral("error")).toString()));
+    check(fake_door::calls.size() == after,
+          QStringLiteral("a broadcast send still asked the module to cancel: %1 calls")
+              .arg(fake_door::calls.size()));
+    check(sendState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("done"),
+          QStringLiteral("a refused cancel unsaid the send: %1").arg(backend.privateSendJson()));
+
+    if (failures == before)
+        pass("a send that has been broadcast refuses a cancel and stays done");
+}
+
+// ── a human said no ──────────────────────────────────────────────────────────
+void aDeclinedApprovalEndsTheSendInItsOwnWords()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, planReply(100, 11721000, true));
+    backend.startPrivateSend(sendJson());
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("relayed_send")))
+        return;
+    fake_door::answerJson(1, QJsonObject{ { "ok", true },
+                                          { "pending", true },
+                                          { "requestId", "handle-1" } });
+    if (!expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("relayed_send_status")))
+        return;
+    fake_door::answerJson(2, QJsonObject{ { "ok", true },
+                                          { "state", "declined" },
+                                          { "reason", "rejected" } });
+
+    check(sendState(backend).value(QStringLiteral("state")).toString() == QStringLiteral("failed"),
+          QStringLiteral("a declined send is not reported failed: %1").arg(backend.privateSendJson()));
+    check(legState(backend, QStringLiteral("approve")) == QStringLiteral("failed"),
+          QStringLiteral("the approval leg is not the one that failed: %1")
+              .arg(backend.privateSendJson()));
+    check(sendState(backend).value(QStringLiteral("error")).toString().contains(
+              QStringLiteral("rejected")),
+          QStringLiteral("the signer's own reason was dropped: %1").arg(backend.privateSendJson()));
+
+    // ...and nothing is polled after a decision.
+    const int after = fake_door::calls.size();
+    settleUntilCall(after, 3000);
+    check(fake_door::calls.size() == after,
+          QStringLiteral("a declined send was still polled: %1 calls").arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("a declined approval ends the send, in the signer's own words");
+}
+
+// ── a send this wallet cannot even ask for ───────────────────────────────────
+//
+// The same rule the custom-token field follows: what the wallet can see is
+// wrong, it says so HERE, without spending a round trip and without a refusal
+// that names a module as if the module were the problem.
+void aSendWithNoBundlerIsRefusedWithoutAsking()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    QJsonObject params = parse(sendJson());
+    params.remove(QStringLiteral("bundlerUrl"));
+    const QJsonObject refused = parse(backend.startPrivateSend(
+        QString::fromUtf8(QJsonDocument(params).toJson(QJsonDocument::Compact))));
+
+    check(!refused.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a send with no bundler was accepted: %1")
+              .arg(QString::fromUtf8(QJsonDocument(refused).toJson(QJsonDocument::Compact))));
+    check(refused.value(QStringLiteral("error")).toString().contains(QStringLiteral("bundler")),
+          QStringLiteral("the refusal does not name the missing field: %1")
+              .arg(refused.value(QStringLiteral("error")).toString()));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("a malformed send still asked a module: %1 calls")
+              .arg(fake_door::calls.size()));
+    check(!backend.statusText().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("a malformed send is reported as a missing build: %1")
+              .arg(backend.statusText()));
+
+    if (failures == before)
+        pass("a send with a field missing is refused here, without a round trip");
+}
+
+// ── one send at a time, and it joins the walk already running ────────────────
+//
+// `railgun_module` is `concurrency: single`. A second send would queue behind
+// the first; a send started while the user is already walking the tree must
+// take that walk as its sync leg rather than asking for a second chain of
+// windows against the same plan.
+void aSendJoinsAWalkAlreadyRunning()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.startPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+
+    backend.startPrivateSend(sendJson());
+    check(sendState(backend).value(QStringLiteral("leg")).toString() == QStringLiteral("sync"),
+          QStringLiteral("a send started during a walk is not on the sync leg: %1")
+              .arg(backend.privateSendJson()));
+    check(fake_door::calls.size() == 1,
+          QStringLiteral("a send started a second chain of windows: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    // The walk that was already running finishes, and the send it was adopted
+    // by carries on into the proof.
+    fake_door::answerJson(0, planReply(100, 11721000, true));
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("relayed_send")))
+        return;
+    check(legState(backend, QStringLiteral("sync")) == QStringLiteral("done"),
+          QStringLiteral("the adopted walk did not complete the sync leg: %1")
+              .arg(backend.privateSendJson()));
+
+    // ...and a SECOND send is refused rather than queued.
+    const QJsonObject second = parse(backend.startPrivateSend(sendJson()));
+    check(!second.value(QStringLiteral("ok")).toBool(),
+          QStringLiteral("a second private send was accepted: %1")
+              .arg(QString::fromUtf8(QJsonDocument(second).toJson(QJsonDocument::Compact))));
+
+    if (failures == before)
+        pass("a send takes the walk already running as its sync leg, and there is only ever one send");
+}
+
+// ── cancelling during the walk keeps what the walk did ───────────────────────
+void cancellingDuringTheSyncLegKeepsTheBlocks()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(0, behindReply());
+    backend.startPrivateSend(sendJson());
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("sync_step")))
+        return;
+
+    backend.cancelPrivateSend();
+    const std::optional<fake_door::Call> cancelled =
+        expectCall(2, QStringLiteral("railgun_module"), QStringLiteral("sync_cancel"));
+    if (!cancelled)
+        return;
+    QJsonObject reply = planReply(40, 11720400, false);
+    reply.insert(QStringLiteral("cancelled"), true);
+    reply.insert(QStringLiteral("keptToBlock"), 11720400);
+    fake_door::answerJson(2, reply);
+
+    // The window that was in flight lands after the user has left, and must not
+    // carry the send on into a proof nobody asked for any more.
+    fake_door::answerJson(1, planReply(100, 11721000, true));
+    check(fake_door::calls.size() == 3,
+          QStringLiteral("a cancelled send still went on to prove: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    check(sendState(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("cancelled"),
+          QStringLiteral("the send does not report the cancel: %1").arg(backend.privateSendJson()));
+    const QString note = sendState(backend).value(QStringLiteral("note")).toString();
+    check(note.contains(QStringLiteral("11720400")),
+          QStringLiteral("the note does not name the block the walk kept: %1").arg(note));
+
+    if (failures == before)
+        pass("a cancel during the walk keeps every window it finished, and no proof is asked for");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -864,6 +1311,14 @@ int main(int argc, char** argv)
     aStalledSyncStopsAskingAndSaysWhereItGotTo();
     theFirstStatusReadRetriesThroughTheAdmissionRace();
     theRetryIsBoundedAndTheLastRefusalIsPublished();
+    aPrivateSendNamesEveryLegItRuns();
+    aSendOnASyncedTreeSkipsTheWalk();
+    cancellingDuringTheApprovalWithdrawsTheRequest();
+    aBroadcastSendCannotBeRecalled();
+    aDeclinedApprovalEndsTheSendInItsOwnWords();
+    aSendWithNoBundlerIsRefusedWithoutAsking();
+    aSendJoinsAWalkAlreadyRunning();
+    cancellingDuringTheSyncLegKeepsTheBlocks();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

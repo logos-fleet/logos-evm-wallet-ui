@@ -51,14 +51,16 @@ public:
     void refreshPrivateSync() override;
     QString startPrivateSync() override;
     QString cancelPrivateSync() override;
+    QString startPrivateSend(QString sendJson) override;
+    QString cancelPrivateSend() override;
 
 private:
     // Shared by sendNative/sendErc20: record the request id and tell the user
     // where the decision happens.
     QString trackSend(QString reply);
 
-    // Shared by startPrivateSync/cancelPrivateSync: publish `unavailable` and
-    // return the refusal envelope naming railgun_module.
+    // Shared by every control on the Private tab: publish `unavailable` on both
+    // surfaces and return the refusal envelope naming railgun_module.
     QString refuseWithoutRailgun();
 
 protected:

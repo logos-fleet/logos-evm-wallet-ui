@@ -100,6 +100,10 @@ public slots:
     QString startPrivateSync() override;
     QString cancelPrivateSync() override;
 
+    // ...and the send the sync is a leg of.
+    QString startPrivateSend(QString sendJson) override;
+    QString cancelPrivateSend() override;
+
 private:
     // THE VARIANT STARTS ITSELF. There is no onContextReady in a wasm image:
     // the host constructs this object in main() and the page's bridge is not
@@ -176,11 +180,22 @@ private:
     // flight, so "stop" is "do not ask again".
     bool m_syncRunning = false;
     bool m_syncCancelled = false;
+    // WHAT THE WALK IS FOR, when it is for something. A walk the user asked for
+    // on the Private tab ends and that is all; a walk a SEND asked for is that
+    // send's first leg and has to hand over to the second. Set by
+    // startPrivateSend, run once at whichever end the walk reaches (finished,
+    // stalled, refused or cancelled) and cleared before it runs, so the two
+    // paths that can end a walk at the same moment — the cancel's own reply and
+    // the window that was already in flight — cannot both carry the send on.
+    std::function<void(bool, const QString&)> m_syncThen;
     // The last plan `railgun_module` answered with, kept so a cancel can report
     // the block the walk reached without asking for it a second time.
     QJsonObject m_syncPlan;
 
     void stepPrivateSync();
+    // The walk has reached an end. Runs `m_syncThen` at most once; a walk
+    // nobody is waiting on simply has none.
+    void syncLegEnded(bool ok, const QString& why);
     // Publish `privateSyncJson`. `state` is the verdict this variant puts on
     // the module's plan (idle / running / done / cancelled / unavailable);
     // `plan` is the module's own fields, passed through unchanged so the view
@@ -193,9 +208,65 @@ private:
     // all lands here too, which is the honest answer for it — this variant
     // does not declare railgun a dependency (see the .cpp) precisely so that
     // build still loads.
-    void privateSyncUnavailable(const QString& method,
-                                const logos::web::ModuleCallResult& res,
-                                const QJsonObject& reply);
+    QString privateSyncUnavailable(const QString& method,
+                                   const logos::web::ModuleCallResult& res,
+                                   const QJsonObject& reply);
+
+    // ── the private send, run as its legs ────────────────────────────────────
+    //
+    // ONE CALL IN FLIGHT AT A TIME, all the way down the route, for the same
+    // reason the walk chains its windows: a route where exactly one thing is
+    // outstanding is a route where "cancel" has one meaning, and the meaning is
+    // "do not make the next call". The legs are `sync` (the walk above),
+    // `prove` (`relayed_send`: the 7702 UserOp, its Groth16 proof, and an
+    // approval request lodged with keystore_module), `approve` (a human in the
+    // Signer app, polled for) and `broadcast` (the approved operation submitted
+    // to the bundler through eth_rpc).
+    //
+    // WHAT A CANCEL COSTS AT EACH LEG, which is what #235 asks to be decided
+    // and documented rather than discovered: during `sync` nothing has been
+    // sent and every window the walk finished is persisted; during `prove` and
+    // `approve` nothing has been signed and the request is withdrawn from the
+    // approver's queue; after `broadcast` there is nothing to cancel and the
+    // ask is REFUSED. A shield that was mined before any of this is untouched
+    // throughout — it is the chain's, owned by this wallet's 0zk address.
+    bool m_sendRunning = false;
+    bool m_sendCancelled = false;
+    // The leg running now, and every leg with its own state. `m_sendLeg` is a
+    // convenience for a view that shows one line; `m_sendLegs` is the route,
+    // and is what makes "skipped" distinguishable from "done".
+    QString m_sendLeg;
+    QJsonArray m_sendLegs;
+    // The approval request `relayed_send` lodged, kept because a withdrawal
+    // names it and because a view showing a pending send should be able to.
+    QString m_sendRequestId;
+    QString m_sendUserOpHash;
+    // The parameters this send was started with, normalised — held because the
+    // prove leg is issued after the walk, which is minutes later.
+    QJsonObject m_sendParams;
+
+    // Lay out a fresh route: four legs, all pending.
+    void resetSendRoute();
+    void setSendLeg(const QString& leg, const QString& state);
+    QString sendLegState(const QString& leg) const;
+    // The prove leg: `relayed_send`, whose reply is the approval request's id.
+    void beginSendProve();
+    // The approve leg: `relayed_send_status`, until a human has decided. The
+    // poll that answers `done` is also the call that submitted the operation,
+    // so the broadcast leg is reported by its RESULT and never as running —
+    // this side cannot see it start.
+    void pollSendApproval();
+    // A leg that could not go on: the console, the status line, the leg and the
+    // send all say the same thing, which is why they are said in one place.
+    void failSendLeg(const QString& leg, const QString& why);
+    // Take the approval request out of the Signer's queue and end the send.
+    void withdrawSendRequest();
+    void publishPrivateSend(const QString& state, const QString& note = QString(),
+                            const QString& error = QString());
+    // The send is over, however it ended. The approval poll stops on its own:
+    // its timer checks `m_sendRunning` before it asks again.
+    void finishSend(const QString& state, const QString& note = QString(),
+                    const QString& error = QString());
 
     QJsonObject chainById(int chainId) const;
     void seedDefaultChains();

@@ -279,11 +279,32 @@ QString privateSyncUnavailable()
     return jsonText(QJsonObject{ { QStringLiteral("sync"), sync } });
 }
 
+// THE SEND'S SURFACE, IN THE SAME SHAPE AND WITH THE SAME VERDICT. The route is
+// still spelled out — a reader of this build should be able to see what a
+// private send would consist of — and every leg carries `unavailable` rather
+// than `pending`, because `pending` would promise a leg that is coming.
+QString privateSendUnavailable()
+{
+    QJsonArray legs;
+    for (const QString& leg : { QStringLiteral("sync"), QStringLiteral("prove"),
+                                QStringLiteral("approve"), QStringLiteral("broadcast") })
+        legs.append(QJsonObject{ { QStringLiteral("name"), leg },
+                                 { QStringLiteral("state"), QStringLiteral("unavailable") } });
+    QJsonObject send;
+    send.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
+    send.insert(QStringLiteral("leg"), QString());
+    send.insert(QStringLiteral("legs"), legs);
+    send.insert(QStringLiteral("cancellable"), false);
+    send.insert(QStringLiteral("error"), kRailgunAbsent);
+    return jsonText(QJsonObject{ { QStringLiteral("send"), send } });
+}
+
 } // namespace
 
 void WalletUiBackend::refreshPrivateSync()
 {
     setPrivateSyncJson(privateSyncUnavailable());
+    setPrivateSendJson(privateSendUnavailable());
 }
 
 // Both controls on the Private tab answer the same way here, because both are
@@ -292,6 +313,7 @@ void WalletUiBackend::refreshPrivateSync()
 QString WalletUiBackend::refuseWithoutRailgun()
 {
     setPrivateSyncJson(privateSyncUnavailable());
+    setPrivateSendJson(privateSendUnavailable());
     setStatusText(kRailgunAbsent);
     return jsonText(QJsonObject{ { QStringLiteral("ok"), false },
                                  { QStringLiteral("error"), kRailgunAbsent } });
@@ -306,5 +328,16 @@ QString WalletUiBackend::cancelPrivateSync()
 {
     // Nothing is running, so there is nothing to stop — and saying "cancelled"
     // for a walk that never started would be the one answer worse than a refusal.
+    return refuseWithoutRailgun();
+}
+
+QString WalletUiBackend::startPrivateSend(QString sendJson)
+{
+    Q_UNUSED(sendJson)
+    return refuseWithoutRailgun();
+}
+
+QString WalletUiBackend::cancelPrivateSend()
+{
     return refuseWithoutRailgun();
 }

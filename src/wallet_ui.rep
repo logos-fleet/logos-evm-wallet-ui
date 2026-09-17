@@ -29,6 +29,24 @@ class WalletUi
     // spinner. `state` is idle / running / done / cancelled / unavailable, and
     // the last of those carries the reason in `error`.
     PROP(QString privateSyncJson READONLY)
+    // THE WHOLE OF A PRIVATE SEND, LEG BY LEG, as one JSON object:
+    // `{ "send": { state, leg, legs: [{ name, state, note? }], … } }`.
+    //
+    // `privateSyncJson` above is ONE leg of this — the long one. This is the
+    // send itself: `sync` (walk the accumulator up to the head), `prove`
+    // (`relayed_send` builds the 7702 UserOp and its Groth16 proof and lodges
+    // an approval request), `approve` (a human answers it in the Signer app)
+    // and `broadcast` (the approved operation goes to the bundler through
+    // eth_rpc). `leg` is the one running; `legs` is every leg with its own
+    // state (pending / running / done / skipped / cancelled / failed), so a
+    // view can show the whole route and not only the current step.
+    //
+    // WHY A SEND NEEDS THIS AT ALL: measured end to end, a RAILGUN private
+    // send is ~154 s on a simulator and 239 s on a physical iPad, and a fixed
+    // waiter under three minutes reports a failure for work that goes on to
+    // succeed (logos-workspace#235). Nothing here is a guess — every state
+    // change is a reply that landed.
+    PROP(QString privateSendJson READONLY)
 
     // Config / privacy
     SLOT(bool setProxyConfig(QString proxyJson))
@@ -84,4 +102,29 @@ class WalletUi
     SLOT(void refreshPrivateSync())
     SLOT(QString startPrivateSync())
     SLOT(QString cancelPrivateSync())
+
+    // A PRIVATE SEND, RUN AS ITS LEGS. `sendJson` is
+    // `{to, asset, amount, memo?, owner, bundlerUrl}` — `to` is a `0zk…`
+    // (private transfer) or a `0x…` (unshield), `owner` is the EOA that signs
+    // the relayed operation and pays nothing, and `bundlerUrl` is the ERC-4337
+    // bundler the operation is submitted to. Progress lands in
+    // `privateSendJson`; the sync leg's own percentage stays in
+    // `privateSyncJson`, which is the same walk seen from the same place.
+    //
+    // THE SEND STARTS THE WALK, and nothing else does — #235's fourth question
+    // answered where it can be answered honestly. A wallet reads the DISTANCE
+    // automatically (one `eth_blockNumber`), because that is one RPC and is
+    // what lets it warn before a send is offered; WALKING is minutes of a
+    // phone's radio, so it happens when something needs the tree, which is a
+    // send. A send that finds the tree already at the head skips the leg and
+    // says so.
+    SLOT(QString startPrivateSend(QString sendJson))
+    // GIVE UP ON THE SEND IN FLIGHT, and what that means depends on the leg —
+    // which is why the answer is on the surface rather than in a tooltip.
+    // During `sync` nothing was sent at all and every walked window is kept.
+    // During `prove` and `approve` nothing has been signed or broadcast, and
+    // the approval request is withdrawn from the Signer's queue. Once
+    // `broadcast` has happened there is nothing to cancel — the operation is
+    // the chain's — and this REFUSES rather than pretending otherwise.
+    SLOT(QString cancelPrivateSend())
 }
