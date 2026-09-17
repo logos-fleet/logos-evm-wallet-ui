@@ -431,4 +431,9 @@ private:
     // What every method this variant does not implement answers with. Names the
     // module that would have served it, so the refusal is diagnosable.
     QString refuse(const QString& what, const QString& module);
+    // A call to the coordinator that was refused -- by the module, or by the
+    // door that could not reach it. Its own words, on the status line.
+    void coordinatorRefused(const QString& method,
+                            const logos::web::ModuleCallResult& res,
+                            const QJsonObject& reply);
 };
