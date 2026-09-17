@@ -92,18 +92,16 @@ Item {
         return Theme.palette.textSecondary
     }
 
-    // "2 · prove — running". One line per leg of a send, so the route is
-    // readable as a whole and a leg that was SKIPPED is visibly not a leg that
-    // was run. Built here rather than in the delegate for the same reason
+    // "2 · prove — running". One line per leg of a route, so it is readable as a
+    // whole and a leg that was SKIPPED is visibly not a leg that was run. Built
+    // here rather than in the delegate for the same reason
     // `privateSyncProgressLine` is: the delegate should bind, not compute.
-    function privateSendLegLine(index, leg) {
-        return (index + 1) + " · " + leg.name + " — " + leg.state
-    }
-
-    // The same line for the shield's route, with the transaction hashes a leg
-    // produced appended where there are any — the one thing a user can take to
-    // a block explorer, and the reason a mined leg is worth showing at all.
-    function privateShieldLegLine(index, leg) {
+    //
+    // ONE FUNCTION FOR BOTH ROUTES, because they are one shape. Where a leg
+    // carries the transaction `hashes` it produced — only the shield's do — they
+    // are appended: they are the one thing a user can take to a block explorer,
+    // and the reason a mined leg is worth showing at all.
+    function privateLegLine(index, leg) {
         var line = (index + 1) + " · " + leg.name + " — " + leg.state
         if (leg.hashes && leg.hashes.length)
             line += "  ·  " + leg.hashes.join(", ")
@@ -748,7 +746,7 @@ Item {
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Theme.typography.secondaryText
                                 color: root.privateStateColor(modelData.state)
-                                text: root.privateShieldLegLine(index, modelData)
+                                text: root.privateLegLine(index, modelData)
                             }
                         }
                     }
@@ -824,7 +822,7 @@ Item {
                                 Layout.fillWidth: true
                                 font.pixelSize: Theme.typography.secondaryText
                                 color: root.privateStateColor(modelData.state)
-                                text: root.privateSendLegLine(index, modelData)
+                                text: root.privateLegLine(index, modelData)
                             }
                         }
                     }

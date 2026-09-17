@@ -1589,7 +1589,6 @@ void aShieldNamesEveryLegItPutsOnChain()
              "consecutive nonces, and follows each to its receipt");
 }
 
-
 // ── a leg that was not needed is not a leg that ran ──────────────────────────
 //
 // The same distinction the send's route makes between `skipped` and `done`, on
@@ -1864,7 +1863,8 @@ void aShieldWithAnUnencodableAmountIsRefusedWithoutAsking()
     // `Shield`, the form had no `owner`, and `privateShieldJson` was never
     // published — so the refusal existed only on the status line and the route
     // panel was blank (logos-workspace#235).
-    check(shieldState(backend).value(QStringLiteral("error")).toString() == refused.value(QStringLiteral("error")).toString(),
+    check(shieldState(backend).value(QStringLiteral("error")).toString()
+              == refused.value(QStringLiteral("error")).toString(),
           QStringLiteral("the refusal did not reach the shield's own surface: %1")
               .arg(backend.privateShieldJson()));
     check(shieldLeg(backend, QStringLiteral("plan")) == QStringLiteral("pending"),

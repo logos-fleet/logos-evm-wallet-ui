@@ -5,6 +5,8 @@
 #include <QJsonValue>
 #include <QStringList>
 
+#include <initializer_list>
+
 // The only way out of a wasm image. See wallet_ui_web_backend.h for why this
 // backend exists at all, and logos_web_module_call.h for what the door is.
 #include "logos_web_module_call.h"
@@ -221,6 +223,46 @@ bool callSucceeded(const logos::web::ModuleCallResult& res, const QJsonObject& r
 QString refusalReason(const logos::web::ModuleCallResult& res, const QJsonObject& reply)
 {
     return res.ok ? errorOf(reply) : res.error;
+}
+
+// "railgun_module refused relayed_send: …" — the one sentence a refusal is said
+// in, written once so every caller names the module it asked and the method it
+// asked for, in the same order and with the same punctuation.
+QString moduleRefused(const QString& module, const QString& method,
+                      const logos::web::ModuleCallResult& res, const QJsonObject& reply)
+{
+    return QStringLiteral("%1 refused %2: %3").arg(module, method, refusalReason(res, reply));
+}
+
+// A ROUTE LAID OUT FRESH: every leg named, in the order it is walked, and all of
+// them `pending`. The send's route and the shield's are the same shape — a
+// named leg with a state each — so they are laid out and moved by the same two
+// helpers rather than by two copies of them.
+QJsonArray pendingRoute(std::initializer_list<QString> legs)
+{
+    QJsonArray route;
+    for (const QString& leg : legs)
+        route.append(QJsonObject{ { QStringLiteral("name"), leg },
+                                  { QStringLiteral("state"), kStatePending } });
+    return route;
+}
+
+// ...and moving one leg of it, along with the line that names what is RUNNING.
+// `running` is only moved by a leg that STARTS: a leg that ends leaves it where
+// it was, which is what lets a failed or cancelled route still say which leg it
+// was on.
+void markLeg(QJsonArray& route, QString& running, const QString& leg, const QString& state)
+{
+    for (int i = 0; i < route.size(); ++i) {
+        QJsonObject entry = route.at(i).toObject();
+        if (entry.value(QStringLiteral("name")).toString() != leg)
+            continue;
+        entry.insert(QStringLiteral("state"), state);
+        route.replace(i, entry);
+        break;
+    }
+    if (state == kStateRunning)
+        running = leg;
 }
 
 // ...AND THE SAME, ON THE PAGE'S CONSOLE, for the keystore — whose callers
@@ -1495,14 +1537,6 @@ const QString kAlreadyBroadcast = QStringLiteral(
     "This private send has already been broadcast: the operation is the chain's now and "
     "cannot be recalled.");
 
-// "railgun_module refused relayed_send: …" — the one sentence a refusal on this
-// route is said in, written once so every leg names the method it asked for.
-QString railgunRefused(const QString& method, const logos::web::ModuleCallResult& res,
-                       const QJsonObject& reply)
-{
-    return QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, refusalReason(res, reply));
-}
-
 // What a send needs before this variant will spend a round trip on it, in the
 // order a user fills them in. Same rule the custom-token field follows: what
 // the wallet can see is wrong it says HERE, and never as a refusal that names a
@@ -1532,27 +1566,12 @@ QString missingSendField(const QJsonObject& p)
 void WalletUiWebBackend::resetSendRoute()
 {
     m_sendLeg.clear();
-    m_sendLegs = QJsonArray{};
-    for (const QString& leg : { kLegSync, kLegProve, kLegApprove, kLegBroadcast })
-        m_sendLegs.append(QJsonObject{ { QStringLiteral("name"), leg },
-                                       { QStringLiteral("state"), kStatePending } });
+    m_sendLegs = pendingRoute({ kLegSync, kLegProve, kLegApprove, kLegBroadcast });
 }
 
 void WalletUiWebBackend::setSendLeg(const QString& leg, const QString& state)
 {
-    for (int i = 0; i < m_sendLegs.size(); ++i) {
-        QJsonObject entry = m_sendLegs.at(i).toObject();
-        if (entry.value(QStringLiteral("name")).toString() != leg)
-            continue;
-        entry.insert(QStringLiteral("state"), state);
-        m_sendLegs.replace(i, entry);
-        break;
-    }
-    // `leg` names what is RUNNING, so it is only moved by a leg that starts.
-    // A leg that ends leaves it where it was, which is what lets a failed or
-    // cancelled send still say which leg it was on.
-    if (state == kStateRunning)
-        m_sendLeg = leg;
+    markLeg(m_sendLegs, m_sendLeg, leg, state);
 }
 
 QString WalletUiWebBackend::sendLegState(const QString& leg) const
@@ -1661,7 +1680,7 @@ void WalletUiWebBackend::beginSendProve()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failSendLeg(kLegProve,
-                            railgunRefused(QStringLiteral("relayed_send"), res, reply));
+                            moduleRefused(kRailgun, QStringLiteral("relayed_send"), res, reply));
                 return;
             }
             m_sendRequestId = reply.value(QStringLiteral("requestId")).toString();
@@ -1695,7 +1714,8 @@ void WalletUiWebBackend::pollSendApproval()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failSendLeg(kLegApprove,
-                            railgunRefused(QStringLiteral("relayed_send_status"), res, reply));
+                            moduleRefused(kRailgun, QStringLiteral("relayed_send_status"),
+                                          res, reply));
                 return;
             }
             const QString state = reply.value(QStringLiteral("state")).toString();
@@ -1766,7 +1786,7 @@ void WalletUiWebBackend::withdrawSendRequest()
                 // sweeps on its own — so the outcome for the user is the same
                 // and the difference is said rather than hidden.
                 const QString why =
-                    railgunRefused(QStringLiteral("relayed_send_cancel"), res, reply);
+                    moduleRefused(kRailgun, QStringLiteral("relayed_send_cancel"), res, reply);
                 announce(why);
                 finishSend(kStateCancelled, kCancelledBeforeSigning, why);
                 return;
@@ -2020,54 +2040,17 @@ const QString kShieldAlreadyOnChain = QStringLiteral(
     "These transactions have already been broadcast: they are the chain's now, they are "
     "ordered by nonce and they cannot be recalled.");
 
-QString ethRefused(const QString& method, const logos::web::ModuleCallResult& res,
-                   const QJsonObject& reply)
-{
-    return QStringLiteral("%1 refused %2: %3").arg(kEthRpc, method, refusalReason(res, reply));
-}
-
-QString keystoreRefusedLine(const QString& method, const logos::web::ModuleCallResult& res,
-                            const QJsonObject& reply)
-{
-    return QStringLiteral("%1 refused %2: %3").arg(kKeystore, method, refusalReason(res, reply));
-}
-
 } // namespace
 
 void WalletUiWebBackend::resetShieldRoute()
 {
     m_shieldLeg.clear();
-    m_shieldLegs = QJsonArray{};
-    for (const QString& leg : { kLegPlan, kLegSign, kLegWrap, kLegAllow, kLegShield })
-        m_shieldLegs.append(QJsonObject{ { QStringLiteral("name"), leg },
-                                         { QStringLiteral("state"), kStatePending } });
+    m_shieldLegs = pendingRoute({ kLegPlan, kLegSign, kLegWrap, kLegAllow, kLegShield });
 }
 
 void WalletUiWebBackend::setShieldLeg(const QString& leg, const QString& state)
 {
-    for (int i = 0; i < m_shieldLegs.size(); ++i) {
-        QJsonObject entry = m_shieldLegs.at(i).toObject();
-        if (entry.value(QStringLiteral("name")).toString() != leg)
-            continue;
-        entry.insert(QStringLiteral("state"), state);
-        m_shieldLegs.replace(i, entry);
-        break;
-    }
-    // `leg` names what is RUNNING, so only a leg that starts moves it — the
-    // same rule the send's route follows, and what lets a failed route still
-    // say which leg it was on.
-    if (state == kStateRunning)
-        m_shieldLeg = leg;
-}
-
-QString WalletUiWebBackend::shieldLegState(const QString& leg) const
-{
-    for (const QJsonValue& v : m_shieldLegs) {
-        const QJsonObject entry = v.toObject();
-        if (entry.value(QStringLiteral("name")).toString() == leg)
-            return entry.value(QStringLiteral("state")).toString();
-    }
-    return QString();
+    markLeg(m_shieldLegs, m_shieldLeg, leg, state);
 }
 
 QString WalletUiWebBackend::startPrivateShield(QString shieldJson)
@@ -2089,7 +2072,6 @@ QString WalletUiWebBackend::startPrivateShield(QString shieldJson)
         // refusal is about the shield the user is trying to start NOW, and an
         // `idle` state over a route still showing `done` legs reads as neither.
         m_shieldTxs = QJsonArray{};
-        m_shieldLeg.clear();
         resetShieldRoute();
         publishPrivateShield(kStateIdle, QString(), missing);
         return failed(missing);
@@ -2134,7 +2116,8 @@ QString WalletUiWebBackend::startPrivateShield(QString shieldJson)
                     const QJsonObject reply = replyOf(res);
                     if (!callSucceeded(res, reply)) {
                         failShieldLeg(kLegPlan,
-                                      railgunRefused(QStringLiteral("prepare_shield"), res, reply));
+                                      moduleRefused(kRailgun, QStringLiteral("prepare_shield"),
+                                                    res, reply));
                         return;
                     }
                     const QJsonArray txs = reply.value(QStringLiteral("txs")).toArray();
@@ -2169,7 +2152,8 @@ void WalletUiWebBackend::shieldReadNonce()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failShieldLeg(kLegPlan,
-                              ethRefused(QStringLiteral("get_transaction_count"), res, reply));
+                              moduleRefused(kEthRpc, QStringLiteral("get_transaction_count"),
+                                            res, reply));
                 return;
             }
             bool ok = false;
@@ -2192,7 +2176,8 @@ void WalletUiWebBackend::shieldReadGasPrice()
         [this](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
-                failShieldLeg(kLegPlan, ethRefused(QStringLiteral("gas_price"), res, reply));
+                failShieldLeg(kLegPlan,
+                              moduleRefused(kEthRpc, QStringLiteral("gas_price"), res, reply));
                 return;
             }
             bool ok = false;
@@ -2333,7 +2318,8 @@ void WalletUiWebBackend::requestShieldApproval()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failShieldLeg(kLegSign,
-                              keystoreRefusedLine(QStringLiteral("request_approval"), res, reply));
+                              moduleRefused(kKeystore, QStringLiteral("request_approval"),
+                                            res, reply));
                 return;
             }
             m_shieldHandle = reply.value(QStringLiteral("handle")).toString();
@@ -2364,7 +2350,8 @@ void WalletUiWebBackend::pollShieldApproval()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failShieldLeg(kLegSign,
-                              keystoreRefusedLine(QStringLiteral("approval_status"), res, reply));
+                              moduleRefused(kKeystore, QStringLiteral("approval_status"),
+                                            res, reply));
                 return;
             }
             const QString state = reply.value(QStringLiteral("state")).toString();
@@ -2420,7 +2407,7 @@ void WalletUiWebBackend::collectShieldSignatures()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failShieldLeg(kLegSign,
-                              keystoreRefusedLine(QStringLiteral("fetch_result"), res, reply));
+                              moduleRefused(kKeystore, QStringLiteral("fetch_result"), res, reply));
                 return;
             }
             m_shieldSigned.clear();
@@ -2478,7 +2465,9 @@ void WalletUiWebBackend::broadcastShieldTx()
         [this, index, leg](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
-                failShieldLeg(leg, ethRefused(QStringLiteral("send_raw_transaction"), res, reply));
+                failShieldLeg(leg,
+                              moduleRefused(kEthRpc, QStringLiteral("send_raw_transaction"),
+                                            res, reply));
                 return;
             }
             QJsonObject tx = m_shieldTxs.at(index).toObject();
@@ -2538,7 +2527,8 @@ void WalletUiWebBackend::followShieldReceipt()
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
                 failShieldLeg(leg,
-                              ethRefused(QStringLiteral("get_transaction_receipt"), res, reply));
+                              moduleRefused(kEthRpc, QStringLiteral("get_transaction_receipt"),
+                                            res, reply));
                 return;
             }
             const QJsonValue result = resultOf(reply);

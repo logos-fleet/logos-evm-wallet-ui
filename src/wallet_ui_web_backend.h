@@ -326,7 +326,6 @@ private:
 
     void resetShieldRoute();
     void setShieldLeg(const QString& leg, const QString& state);
-    QString shieldLegState(const QString& leg) const;
     // The three reads the plan is made of, chained because two calls issued in
     // one turn are answered in whatever order the container finishes them (see
     // ensureChainConfig).
