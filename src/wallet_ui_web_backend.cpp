@@ -517,6 +517,28 @@ void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint,
         });
 }
 
+namespace {
+
+// THE SETTINGS LINE FOR A DOCUMENT THE COORDINATOR ACCEPTED, which says WHAT
+// was applied and not that something was: the settings tab has two fields, and
+// a user who mistyped one needs to see which value the wallet is running with.
+//
+// `proxyRequired` is on both lines because it is the one that decides what
+// happens when the proxy is unreachable: a cleared proxy that is still required
+// is a wallet that will read nothing at all.
+QString proxyApplied(const QString& url, bool required)
+{
+    if (url.isEmpty()) {
+        return required ? QStringLiteral("Proxy cleared — but still required, so chain "
+                                         "reads will fail closed")
+                        : QStringLiteral("Proxy cleared");
+    }
+    return required ? QStringLiteral("Proxy applied: %1 (required)").arg(url)
+                    : QStringLiteral("Proxy applied: %1 (optional)").arg(url);
+}
+
+} // namespace
+
 // THE PROXY SETTINGS ARE THE COORDINATOR'S, and they are asked for now (#250).
 //
 // `wallet_backend_module` holds them and pushes them into `eth_rpc_module` for
@@ -560,22 +582,13 @@ bool WalletUiWebBackend::setProxyConfig(QString proxyJson)
                 setStatusText(said);
                 return;
             }
-            // WHAT WAS APPLIED, not that something was: the settings tab has two
-            // fields and a user who mistyped one needs to see which value the
-            // wallet is actually running with.
+            // Read back from the document that was sent, because the module
+            // answers a bare `true` and carries nothing to report.
             const QJsonObject asked =
                 QJsonDocument::fromJson(proxyJson.toUtf8()).object();
-            const QString url = asked.value(QStringLiteral("proxy")).toString();
-            const bool required = asked.value(QStringLiteral("proxyRequired")).toBool();
             const QString applied =
-                url.isEmpty()
-                    ? QStringLiteral("Proxy cleared%1")
-                          .arg(required ? QStringLiteral(" — but still required, so chain "
-                                                         "reads will fail closed")
-                                        : QString())
-                    : QStringLiteral("Proxy applied: %1%2")
-                          .arg(url, required ? QStringLiteral(" (required)")
-                                             : QStringLiteral(" (optional)"));
+                proxyApplied(asked.value(QStringLiteral("proxy")).toString(),
+                             asked.value(QStringLiteral("proxyRequired")).toBool());
             announce(applied);
             setProxyStatus(applied);
             setStatusText(applied);

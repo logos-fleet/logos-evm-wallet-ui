@@ -49,6 +49,32 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           door = "${logos-module-builder}/wasm";
+
+          # ── WHAT THIS MODULE SHIPS vs WHAT IT DECLARES (#250) ──────────────
+          #
+          # `web-backend` below compiles the `web` backend's own translation
+          # unit and asserts which modules it ASKS. This one asserts which
+          # modules the artifact SAYS it needs -- the other half, and the one
+          # that was wrong on a device: the shipped manifest named four modules
+          # and no optional ones, so the core brought up four and
+          # `wallet_backend_module` sat in the same app image unloaded while
+          # three screens reported it missing.
+          #
+          # Every check in this tree reads metadata.json and therefore agrees
+          # with itself. This one reads the BUILT package.
+          #
+          # Absent, not skipped, when this builder pin publishes no `web` output
+          # or predates the check: there is no artifact to compare, and a stub
+          # here would be a second green line meaning nothing.
+          webManifestCheck = nixpkgs.lib.optionalAttrs
+            ((module.packages.${system} or { }) ? web
+             && logos-module-builder.lib ? checkWebManifest) {
+              web-manifest = logos-module-builder.lib.checkWebManifest pkgs {
+                name = "wallet_ui";
+                webPackage = module.packages.${system}.web;
+                metadataFile = ./metadata.json;
+              };
+            };
         in
         (module.checks.${system} or { }) // {
           web-backend =
@@ -62,31 +88,6 @@
               mkdir -p $out
               echo skipped > $out/result
             '';
-        }
-        # ── WHAT THIS MODULE SHIPS vs WHAT IT DECLARES (#250) ────────────────
-        #
-        # The check above compiles the `web` backend's own translation unit and
-        # asserts which modules it ASKS. This one asserts which modules the
-        # artifact SAYS it needs -- the other half, and the one that was wrong on
-        # a device: the shipped manifest declared four dependencies where
-        # metadata.json declares five plus two optional, so the core brought up
-        # four modules and `wallet_backend_module` sat in the image unloaded
-        # while three screens reported it missing.
-        #
-        # Every check in this tree reads metadata.json and therefore agrees with
-        # itself. This one reads the BUILT package.
-        #
-        # Absent, not skipped, when this builder pin publishes no `web` output:
-        # there is no artifact to compare, and a stub here would be a second
-        # green line meaning nothing.
-        // nixpkgs.lib.optionalAttrs
-             ((module.packages.${system} or { }) ? web
-              && logos-module-builder.lib ? checkWebManifest) {
-          web-manifest = logos-module-builder.lib.checkWebManifest pkgs {
-            name = "wallet_ui";
-            webPackage = module.packages.${system}.web;
-            metadataFile = ./metadata.json;
-          };
-        });
+        } // webManifestCheck);
     };
 }
