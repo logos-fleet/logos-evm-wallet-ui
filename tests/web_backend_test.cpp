@@ -19,6 +19,8 @@
 // unit is compiled natively and driven from here. The header there says what
 // that stub keeps of the real door and why.
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -50,6 +52,19 @@ void check(bool ok, const QString& why)
 void pass(const QString& what)
 {
     std::printf("PASS: %s\n", qPrintable(what));
+}
+
+// LET A QUEUED RETRY FIRE. The backend retries a refusal from the door on a
+// TIMER, because the thing it is waiting for — the core finishing this module's
+// registration — takes wall time and not another turn of the loop. So a drive
+// that wants to see the retry has to spend that wall time; it stops as soon as
+// the retry has been made, so the cost is the delay and not the deadline.
+void settleUntilCall(int index, int deadlineMs)
+{
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < deadlineMs && fake_door::calls.size() <= index)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
 }
 
 QJsonObject parse(const QString& text)
@@ -658,41 +673,6 @@ void cancellingStopsAskingAndSaysWhatItLeft()
         pass("a cancel stops asking for windows, and the view is told what it left");
 }
 
-// ── a build with no railgun says so, by name ─────────────────────────────────
-//
-// This variant does NOT declare railgun_module a dependency: an image carries it
-// only when it was bundled, and declaring it would stop the wallet loading at
-// all on every build that did not. The price of that choice is that the refusal
-// has to be worth reading, so it is asserted here — the module is named, its own
-// words are kept, and the surface says `unavailable` rather than showing a
-// convincing 0 %.
-void aPrivateSyncWithNoRailgunIsNamedNotBlank()
-{
-    const int before = failures;
-    fake_door::reset();
-    WalletUiWebBackend backend;
-
-    backend.refreshPrivateSync();
-    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
-        return;
-    fake_door::failCall(0, QStringLiteral("module not found: railgun_module"));
-
-    const QJsonObject state = privateSync(backend);
-    check(state.value(QStringLiteral("state")).toString() == QStringLiteral("unavailable"),
-          QStringLiteral("a missing railgun did not read as unavailable: %1")
-              .arg(backend.privateSyncJson()));
-    check(state.value(QStringLiteral("error")).toString().contains(QStringLiteral("railgun_module")),
-          QStringLiteral("the refusal does not name the module: %1").arg(backend.privateSyncJson()));
-    check(backend.statusText().contains(QStringLiteral("railgun_module")),
-          QStringLiteral("the status line does not name the module: %1").arg(backend.statusText()));
-    check(!state.contains(QStringLiteral("percent")),
-          QStringLiteral("an unavailable sync still shows a percentage: %1")
-              .arg(backend.privateSyncJson()));
-
-    if (failures == before)
-        pass("a build with no railgun_module is named on the private surface, not blank");
-}
-
 // ── an uninitialised engine keeps its own words ──────────────────────────────
 void aModuleRefusalIsReportedInItsOwnWords()
 {
@@ -770,6 +750,95 @@ void aStalledSyncStopsAskingAndSaysWhereItGotTo()
         pass("a sync that stops making progress is reported, not looped on");
 }
 
+// ── the first status read races the core's load path ─────────────────────────
+//
+// MEASURED ON AN iPad Air 13-inch SIMULATOR, which is how this case came to
+// exist. The page asked `keystore_module` and `railgun_module` in the same turn
+// and BOTH were refused with "token not recognized (re-exchange failed)" — the
+// core had not finished registering this module's credential. `refreshAccounts`
+// retries, so the account list arrived two seconds later; the private surface
+// did not, and it published `unavailable` naming railgun for a module that was
+// loaded and answering in the same run. A refusal by the DOOR that early is a
+// race, not an answer, and the same retry that carries the account list has to
+// carry this.
+//
+// The retry is bounded and the LAST refusal still lands on the surface: a build
+// that really has no railgun_module must not poll for the life of the page.
+void theFirstStatusReadRetriesThroughTheAdmissionRace()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    if (!expectCall(0, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    // THE DOOR refused it, not the module: `res.ok` false, which is the shape a
+    // tokenless call comes back in.
+    fake_door::failCall(0, QStringLiteral(
+        "call to 'railgun_module' rejected: token not recognized (re-exchange failed)"));
+
+    check(privateSync(backend).value(QStringLiteral("state")).toString()
+              != QStringLiteral("unavailable"),
+          QStringLiteral("a refusal during the admission race was published as a verdict: %1")
+              .arg(backend.privateSyncJson()));
+    settleUntilCall(1, 3000);
+    if (!expectCall(1, QStringLiteral("railgun_module"), QStringLiteral("sync_status")))
+        return;
+    fake_door::answerJson(1, planReply(100, 11721000, true));
+    check(privateSync(backend).value(QStringLiteral("state")).toString() == QStringLiteral("done"),
+          QStringLiteral("the retry's answer did not reach the view: %1")
+              .arg(backend.privateSyncJson()));
+
+    if (failures == before)
+        pass("the first status read retries through the core's admission race");
+}
+
+// ── ...and gives up, so a build with no railgun is still named ───────────────
+//
+// The other half of the retry. `railgun_module` is not declared a dependency of
+// this variant (an image carries it only when it was bundled, and declaring it
+// would stop the wallet loading on every build that did not), so "absent" is a
+// state this surface has to report rather than wait out.
+void theRetryIsBoundedAndTheLastRefusalIsPublished()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshPrivateSync();
+    int i = 0;
+    // Refuse every attempt. Bounded by a call count rather than by a deadline, so
+    // a retry budget that grew would be REPORTED here rather than hanging the run.
+    while (i < 32) {
+        if (i >= fake_door::calls.size())
+            break;
+        fake_door::failCall(i, QStringLiteral("module not found: railgun_module"));
+        ++i;
+        settleUntilCall(i, 3000);
+    }
+    check(i < 32, QStringLiteral("the retry never gave up: %1 calls").arg(i));
+    check(privateSync(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("unavailable"),
+          QStringLiteral("a build with no railgun never reached a verdict: %1")
+              .arg(backend.privateSyncJson()));
+    check(privateSync(backend).value(QStringLiteral("error")).toString().contains(
+              QStringLiteral("railgun_module")),
+          QStringLiteral("the last refusal does not name the module: %1")
+              .arg(backend.privateSyncJson()));
+    // NAMED ON THE STATUS LINE TOO, and with no percentage: a build that does
+    // not carry railgun must not render a convincing 0 % for a walk that can
+    // never start.
+    check(backend.statusText().contains(QStringLiteral("railgun_module")),
+          QStringLiteral("the status line does not name the module: %1").arg(backend.statusText()));
+    check(!privateSync(backend).contains(QStringLiteral("percent")),
+          QStringLiteral("an unavailable sync still shows a percentage: %1")
+              .arg(backend.privateSyncJson()));
+
+    if (failures == before)
+        pass("the admission retry gives up, and the last refusal names the module");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -789,10 +858,11 @@ int main(int argc, char** argv)
     aTokenWithNoAddressIsRefusedWithoutAsking();
     theSyncIsWalkedInWindowsAndTheViewSeesEachOne();
     cancellingStopsAskingAndSaysWhatItLeft();
-    aPrivateSyncWithNoRailgunIsNamedNotBlank();
     aModuleRefusalIsReportedInItsOwnWords();
     aSecondStartDoesNotDoubleTheWalk();
     aStalledSyncStopsAskingAndSaysWhereItGotTo();
+    theFirstStatusReadRetriesThroughTheAdmissionRace();
+    theRetryIsBoundedAndTheLastRefusalIsPublished();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

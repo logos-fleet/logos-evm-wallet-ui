@@ -61,8 +61,14 @@ constexpr int kStartupGiveUpMs = 60000;
 // are close together — six over three seconds rather than one wait of two.
 // A phone's first paint of the account list is the thing being spent here.
 constexpr int kAdmissionSettleMs = 250;
-constexpr int kAccountRetries = 6;
-constexpr int kAccountRetryMs = 500;
+// THE RETRY BUDGET FOR THAT RACE, shared by every first ask this variant makes.
+// Not the account list's alone: measured on an iPad Air 13-inch simulator, the
+// keystore AND railgun were both refused "token not recognized (re-exchange
+// failed)" in the same turn, and only the ask that retried ever got an answer
+// (logos-workspace#235). Bounded, because a module that really is absent must
+// be REPORTED rather than polled for the life of the page.
+constexpr int kAdmissionRetries = 6;
+constexpr int kAdmissionRetryMs = 500;
 
 // Every rust-first module on this wire answers a JSON TEXT, not a structure,
 // so a reply is parsed before it is read.
@@ -475,8 +481,8 @@ void WalletUiWebBackend::refreshAccounts()
                 setStatusText(QStringLiteral("keystore_module: %1").arg(res.error));
                 // See kAdmissionSettleMs: a refusal this early is a race with
                 // the core's own load path, not an answer.
-                if (m_accountRetries++ < kAccountRetries)
-                    QTimer::singleShot(kAccountRetryMs, this,
+                if (m_accountRetries++ < kAdmissionRetries)
+                    QTimer::singleShot(kAdmissionRetryMs, this,
                                        [this]() { refreshAccounts(); });
                 return;
             }
@@ -1201,9 +1207,25 @@ void WalletUiWebBackend::refreshPrivateSync()
         [this](const logos::web::ModuleCallResult& res) {
             const QJsonObject reply = replyOf(res);
             if (!callSucceeded(res, reply)) {
+                // A REFUSAL BY THE DOOR THIS EARLY IS A RACE, NOT AN ANSWER —
+                // the same one `refreshAccounts` retries through, and the same
+                // words ("token not recognized"). `res.ok` false is the door's
+                // own failure; a module that answered `{ok:false}` has decided,
+                // and is published straight away.
+                if (!res.ok && m_privateSyncRetries++ < kAdmissionRetries) {
+                    announce(QStringLiteral("%1 refused sync_status (%2/%3): %4")
+                                 .arg(kRailgun)
+                                 .arg(m_privateSyncRetries)
+                                 .arg(kAdmissionRetries)
+                                 .arg(res.error));
+                    QTimer::singleShot(kAdmissionRetryMs, this,
+                                       [this]() { refreshPrivateSync(); });
+                    return;
+                }
                 privateSyncUnavailable(QStringLiteral("sync_status"), res, reply);
                 return;
             }
+            m_privateSyncRetries = 0;
             m_syncPlan = reply;
             // A WALK IN FLIGHT OUTRANKS THE READ. `sync_status` answers
             // `running` for a plan the MODULE holds; this variant knows whether

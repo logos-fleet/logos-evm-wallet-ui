@@ -108,7 +108,9 @@ private:
     // opens, then asks the keystore for accounts once and stops.
     QTimer m_startup;
     int m_startupTicks = 0;
+    // Attempts spent on the admission race, per ask. See kAdmissionRetries.
     int m_accountRetries = 0;
+    int m_privateSyncRetries = 0;
 
     // The chains this variant knows, in the shape the view's `chainsJson`
     // carries. Seeded in the constructor and replaced by setChains().

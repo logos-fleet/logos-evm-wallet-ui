@@ -541,6 +541,16 @@ How far behind the private (shielded) balance is, **without walking anything**.
   safe to ask before a send is offered rather than after.
 - **Publishes:** `privateSyncJson` with `state` `idle` / `running` / `done`, or `unavailable`
   with the reason in `error`.
+- **It retries through the admission race.** Measured on an iPad Air 13-inch simulator: the
+  page asked `keystore_module` and `railgun_module` in the same turn and **both** came back
+  "token not recognized (re-exchange failed)" — the core had not finished registering this
+  module's credential. `refreshAccounts` retries, so the account list arrived two seconds
+  later; the first version of this read did not, and published `unavailable` naming railgun
+  for a module that was loaded and answering in the same run. A refusal *by the door*
+  (`res.ok == false`) that early is a race and is retried (6 × 500 ms, shared with the account
+  list); a module that answered `{ok:false}` has decided and is published straight away. The
+  retry is **bounded**, because a build that really carries no railgun must be reported rather
+  than polled for the life of the page.
 
 ##### `QString startPrivateSync()`
 
