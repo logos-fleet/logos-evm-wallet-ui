@@ -77,7 +77,9 @@ public slots:
 
     // A signing request the wallet raised, polled by the view until a human
     // answers it in the signer UI. This variant never raises one — it cannot
-    // send — so it refuses by name like the rest of the coordinator's surface.
+    // send — so it refuses by name, like the other send routes it has not
+    // wired up (#250 wired the coordinator's history and proxy routes; the
+    // send route is still the coordinator's and still not built here).
     QString sendStatus(QString requestId) override;
 
     // Balances — eth_rpc_module
@@ -453,4 +455,9 @@ private:
     // What every method this variant does not implement answers with. Names the
     // module that would have served it, so the refusal is diagnosable.
     QString refuse(const QString& what, const QString& module);
+    // A call to the coordinator that was refused -- by the module, or by the
+    // door that could not reach it. Its own words, on the status line.
+    void coordinatorRefused(const QString& method,
+                            const logos::web::ModuleCallResult& res,
+                            const QJsonObject& reply);
 };

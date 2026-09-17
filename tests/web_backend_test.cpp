@@ -379,12 +379,20 @@ void anEmptyPhraseIsRefusedWithoutAsking()
         pass("an import with no phrase is refused here, without a round trip");
 }
 
-// ── what really has no mobile build still says so ────────────────────────────
+// ── what this variant has not wired up yet says so IN ITS OWN WORDS ──────────
 //
-// The other four tabs' refusals are TRUE, and they are the reason #147 was
-// confusing rather than obviously wrong. A fix that made every refusal vaguer
-// would cost more than it gained, so the true ones are asserted too.
-void theCoordinatorsSurfaceStillRefusesByName()
+// Sends and fee estimation are the coordinator's, and this variant does not
+// drive them: a send parks a signing request and is polled to a broadcast, and
+// none of that route exists here. So they refuse -- and they name the module
+// that would serve them, because a developer reading the screen needs it.
+//
+// WHAT THEY MAY NO LONGER SAY is "which has no mobile build". It was true when
+// it was written and it is false now: `wallet_backend_module` has been a mobile
+// Bare catalog member since #183 and is in the same app image as this page
+// (logos-workspace#250). A refusal that misnames the reason sends a reader
+// looking for a missing build that is not missing -- which is exactly the cost
+// #147 measured, one module over.
+void whatIsNotWiredUpYetSaysSoWithoutBlamingTheBuild()
 {
     const int before = failures;
     fake_door::reset();
@@ -394,8 +402,11 @@ void theCoordinatorsSurfaceStillRefusesByName()
         const QJsonObject answer = parse(reply);
         check(!answer.value(QStringLiteral("ok")).toBool(),
               QStringLiteral("a method this variant cannot serve answered ok: %1").arg(reply));
-        check(answer.value(QStringLiteral("error")).toString().contains(module),
+        const QString why = answer.value(QStringLiteral("error")).toString();
+        check(why.contains(module),
               QStringLiteral("the refusal does not name %1: %2").arg(module, reply));
+        check(!why.contains(QStringLiteral("no mobile build")),
+              QStringLiteral("the refusal still blames a missing build: %1").arg(reply));
     };
 
     refusesNaming(backend.estimateFee(QStringLiteral("{}")),
@@ -405,17 +416,192 @@ void theCoordinatorsSurfaceStillRefusesByName()
     refusesNaming(backend.sendStatus(QStringLiteral("handle")),
                   QStringLiteral("wallet_backend_module"));
 
-    backend.refreshHistory(QStringLiteral("0xabc"));
-    check(backend.statusText().contains(QStringLiteral("wallet_backend_module")),
-          QStringLiteral("the history refusal does not name its module: %1")
-              .arg(backend.statusText()));
-
     check(fake_door::calls.isEmpty(),
           QStringLiteral("a refusal by name still called out: %1 calls")
               .arg(fake_door::calls.size()));
 
     if (failures == before)
-        pass("the coordinator's own surface still refuses by name");
+        pass("an unwired method names its module without blaming the build");
+}
+
+// ── HISTORY COMES OUT OF THE COORDINATOR (logos-workspace#250) ───────────────
+//
+// It used to refuse without asking anything, on the premise that
+// `wallet_backend_module` had no mobile build. It has had one since #183, it is
+// Bundled into the same app image as this page, and the operator's iPad reported
+// "History needs wallet_backend_module" with that module sitting in the image
+// unloaded -- because this variant never named it and never called it.
+//
+// So the ask is what is asserted, the same way every other tab's is: which
+// module, which method, with what.
+void historyComesFromTheCoordinator()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshHistory(QStringLiteral("0xabc"));
+
+    const auto call = expectCall(0, QStringLiteral("wallet_backend_module"),
+                                 QStringLiteral("get_history"));
+    if (!call)
+        return;
+    check(call->args.size() == 1
+              && call->args.at(0).toString() == QStringLiteral("0xabc"),
+          QStringLiteral("get_history was not asked for the account: %1")
+              .arg(describe(*call)));
+
+    fake_door::answerJson(0, QJsonObject{
+        { "ok", true },
+        { "history", QJsonArray{ QJsonObject{ { "kind", "send" },
+                                              { "status", "confirmed" },
+                                              { "hash", "0xdead" } } } } });
+
+    const QJsonObject published = parse(backend.historyJson());
+    check(published.value(QStringLiteral("history")).toArray().size() == 1,
+          QStringLiteral("the coordinator's history did not reach the tab: %1")
+              .arg(backend.historyJson()));
+    check(!backend.statusText().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("the status line still says the coordinator has no build: %1")
+              .arg(backend.statusText()));
+
+    if (failures == before)
+        pass("history is read from wallet_backend_module and published");
+}
+
+// A build that really does not carry the coordinator is the case the old
+// refusal was written for, and it still has to be told apart from an empty
+// history. The module's own words go on the line, and the tab is emptied rather
+// than left showing the last account's rows.
+void aHistoryRefusalIsReportedInItsOwnWords()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshHistory(QStringLiteral("0xabc"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"),
+                    QStringLiteral("get_history")))
+        return;
+    fake_door::answerJson(0, QJsonObject{ { "ok", false },
+                                          { "error", "no wallet state for this device" } });
+
+    check(backend.statusText().contains(QStringLiteral("wallet_backend_module")),
+          QStringLiteral("the history refusal does not name its module: %1")
+              .arg(backend.statusText()));
+    check(backend.statusText().contains(QStringLiteral("no wallet state")),
+          QStringLiteral("the history refusal drops the module's reason: %1")
+              .arg(backend.statusText()));
+    check(parse(backend.historyJson()).value(QStringLiteral("history")).toArray().isEmpty(),
+          QStringLiteral("a refused history left rows on the tab: %1").arg(backend.historyJson()));
+
+    if (failures == before)
+        pass("a refused history reports the coordinator's reason and empties the tab");
+}
+
+// An account is the whole of what `get_history` takes, so an empty one is
+// refused HERE rather than spent on a round trip -- the rule every other
+// argument check in this file follows.
+void historyWithNoAccountIsRefusedWithoutAsking()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.refreshHistory(QString());
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("an account-less history still called out: %1 calls")
+              .arg(fake_door::calls.size()));
+    check(!backend.statusText().isEmpty(),
+          QStringLiteral("an account-less history said nothing"));
+
+    if (failures == before)
+        pass("a history with no account is refused here, without a round trip");
+}
+
+// ── PROXY CONFIG IS THE COORDINATOR'S, AND IS NOW ASKED FOR (#250) ───────────
+//
+// `wallet_backend_module` owns the wallet's proxy settings and pushes them into
+// eth_rpc for every configured chain. This variant used to answer "Proxy config
+// needs wallet_backend_module" without asking; the operator's Advanced tab
+// reported exactly that with the module in the image.
+//
+// `set_proxy_config` answers a BARE BOOL -- like eth_rpc's `set_chain_config`,
+// not like the `{ok, …}` envelope most of this wire uses -- so the reply is read
+// with `toBool()` and the fixture answers it as the module does.
+void proxyConfigGoesToTheCoordinator()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    const QString proxy = QStringLiteral(
+        R"({"proxy":"socks5h://127.0.0.1:9050","proxyRequired":true})");
+    check(backend.setProxyConfig(proxy),
+          QStringLiteral("setProxyConfig refused instead of taking the ask"));
+
+    const auto call = expectCall(0, QStringLiteral("wallet_backend_module"),
+                                 QStringLiteral("set_proxy_config"));
+    if (!call)
+        return;
+    check(call->args.size() == 1 && call->args.at(0).toString() == proxy,
+          QStringLiteral("set_proxy_config was not given the view's document: %1")
+              .arg(describe(*call)));
+
+    fake_door::answerBool(0, true);
+    check(backend.proxyStatus().contains(QStringLiteral("socks5h://127.0.0.1:9050")),
+          QStringLiteral("the applied proxy is not on the settings line: %1")
+              .arg(backend.proxyStatus()));
+    check(!backend.proxyStatus().contains(QStringLiteral("needs")),
+          QStringLiteral("an applied proxy still reads as a refusal: %1")
+              .arg(backend.proxyStatus()));
+
+    if (failures == before)
+        pass("a proxy document reaches wallet_backend_module and the tab says so");
+}
+
+// A `false` from the module is a REFUSAL and not a quiet success: the settings
+// line must not read as applied when nothing was.
+void aRefusedProxyIsNotReportedAsApplied()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    backend.setProxyConfig(QStringLiteral(R"({"proxy":"nonsense","proxyRequired":true})"));
+    if (!expectCall(0, QStringLiteral("wallet_backend_module"),
+                    QStringLiteral("set_proxy_config")))
+        return;
+    fake_door::answerBool(0, false);
+
+    check(backend.proxyStatus().contains(QStringLiteral("wallet_backend_module")),
+          QStringLiteral("a refused proxy does not name the module that refused: %1")
+              .arg(backend.proxyStatus()));
+    check(!backend.proxyStatus().contains(QStringLiteral("no mobile build")),
+          QStringLiteral("a refused proxy blames a missing build: %1")
+              .arg(backend.proxyStatus()));
+
+    if (failures == before)
+        pass("a proxy the coordinator refuses is not reported as applied");
+}
+
+// An empty document is refused here: `set_proxy_config` parses its argument and
+// answers `false` for anything it cannot read, which is a round trip spent to
+// learn what this side already knows.
+void anEmptyProxyDocumentIsRefusedWithoutAsking()
+{
+    const int before = failures;
+    fake_door::reset();
+    WalletUiWebBackend backend;
+
+    check(!backend.setProxyConfig(QString()),
+          QStringLiteral("an empty proxy document was taken"));
+    check(fake_door::calls.isEmpty(),
+          QStringLiteral("an empty proxy document still called out: %1 calls")
+              .arg(fake_door::calls.size()));
+
+    if (failures == before)
+        pass("an empty proxy document is refused here, without a round trip");
 }
 
 // ── the token list comes out of token_list_module ────────────────────────────
@@ -757,12 +943,23 @@ void aModuleRefusalIsReportedInItsOwnWords()
     fake_door::answerJson(0, QJsonObject{ { "ok", false },
                                           { "error", "railgun_module not initialized (call init first)" } });
 
-    check(privateSync(backend).value(QStringLiteral("error")).toString().contains(
-              QStringLiteral("not initialized")),
+    const QString said = privateSync(backend).value(QStringLiteral("error")).toString();
+    check(said.contains(QStringLiteral("not initialized")),
           QStringLiteral("the module's own reason was dropped: %1").arg(backend.privateSyncJson()));
+    // ...AND WHAT IT MEANS (logos-workspace#250). "not initialized (call init
+    // first)" on its own reads as a broken module, and the operator's iPad read
+    // it exactly that way. The module is fine; the private wallet has never been
+    // brought up on this device, and nothing in this variant brings it up.
+    check(said.contains(QStringLiteral("private wallet")),
+          QStringLiteral("the uninitialised engine is reported as a module fault: %1")
+              .arg(backend.privateSyncJson()));
+    check(privateSync(backend).value(QStringLiteral("state")).toString()
+              == QStringLiteral("unavailable"),
+          QStringLiteral("the private tab shows no sync state at all: %1")
+              .arg(backend.privateSyncJson()));
 
     if (failures == before)
-        pass("an uninitialised engine is reported in railgun_module's own words");
+        pass("an uninitialised engine is a named sync state, not a raw module fault");
 }
 
 // ── one walk at a time ───────────────────────────────────────────────────────
@@ -1977,7 +2174,13 @@ int main(int argc, char** argv)
     withoutALabelNothingIsLabelled();
     aRefusedLabelDoesNotUnsayTheImport();
     anEmptyPhraseIsRefusedWithoutAsking();
-    theCoordinatorsSurfaceStillRefusesByName();
+    whatIsNotWiredUpYetSaysSoWithoutBlamingTheBuild();
+    historyComesFromTheCoordinator();
+    aHistoryRefusalIsReportedInItsOwnWords();
+    historyWithNoAccountIsRefusedWithoutAsking();
+    proxyConfigGoesToTheCoordinator();
+    aRefusedProxyIsNotReportedAsApplied();
+    anEmptyProxyDocumentIsRefusedWithoutAsking();
     theTokenListComesFromItsOwnModule();
     aTokenListRefusalIsReportedInItsOwnWords();
     aCustomTokenGoesToTheModuleAndTheListIsReread();

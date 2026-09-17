@@ -49,6 +49,50 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           door = "${logos-module-builder}/wasm";
+
+          # ── WHAT THIS MODULE SHIPS vs WHAT IT DECLARES (#250) ──────────────
+          #
+          # `web-backend` below compiles the `web` backend's own translation
+          # unit and asserts which modules it ASKS. This one asserts which
+          # modules the artifact SAYS it needs -- the other half, and the one
+          # that was wrong on a device: the shipped manifest named four modules
+          # and no optional ones, so the core brought up four and
+          # `wallet_backend_module` sat in the same app image unloaded while
+          # three screens reported it missing.
+          #
+          # Every check in this tree reads metadata.json and therefore agrees
+          # with itself. This one reads the BUILT package.
+          #
+          # A SKIP THAT SAYS SO, exactly as `web-backend` below does and for the
+          # same pin: this repo's OWN flake.lock still points at a
+          # logos-module-builder without `lib.checkWebManifest`, so from the
+          # sub-repo flake there is no comparison to run. Omitting the attribute
+          # was the first shape of this, and it is what a silent hole looks
+          # like -- `ws test logos-evm-wallet-ui` reported a green run in which
+          # nothing compared the manifest at all. A line naming the pin is what
+          # tells a reader the difference between "checked" and "not checked
+          # here".
+          webManifestCheck =
+            if (module.packages.${system} or { }) ? web
+               && logos-module-builder.lib ? checkWebManifest
+            then {
+              web-manifest = logos-module-builder.lib.checkWebManifest pkgs {
+                name = "wallet_ui";
+                webPackage = module.packages.${system}.web;
+                metadataFile = ./metadata.json;
+              };
+            }
+            else {
+              web-manifest = pkgs.runCommand "wallet-ui-web-manifest-check-skipped" { } ''
+                echo "SKIP: web-manifest -- this logos-module-builder pin has no"
+                echo "      lib.checkWebManifest, or publishes no \`web\` variant for"
+                echo "      this module, so there is no shipped manifest to compare."
+                echo "      Run through the workspace flake:"
+                echo "      ws test logos-evm-wallet-ui --local logos-module-builder"
+                mkdir -p $out
+                echo skipped > $out/result
+              '';
+            };
         in
         (module.checks.${system} or { }) // {
           web-backend =
@@ -62,6 +106,6 @@
               mkdir -p $out
               echo skipped > $out/result
             '';
-        });
+        } // webManifestCheck);
     };
 }

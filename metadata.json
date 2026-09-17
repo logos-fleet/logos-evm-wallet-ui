@@ -25,6 +25,10 @@
       "uniswap_module",
       "token_list_module"
     ],
+    "optional_dependencies": [
+      "wallet_backend_module",
+      "railgun_module"
+    ],
     "view_backend": {
       "class": "WalletUiWebBackend",
       "header": "src/wallet_ui_web_backend.h",

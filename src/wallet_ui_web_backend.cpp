@@ -34,10 +34,30 @@ const QString kUniswap = QStringLiteral("uniswap_module");
 // page and cannot be ported to `fetch` without silently voiding that guarantee.
 // So it crosses as native machine code and this image calls it by name.
 const QString kTokenList = QStringLiteral("token_list_module");
+// THE COORDINATOR, AND IT IS HERE AFTER ALL (logos-workspace#250). This file
+// used to say `wallet_backend_module` had no mobile build and refuse its whole
+// surface without asking. That stopped being true at #183, which gave it a
+// mobile Bare build and a catalog entry: on the operator's iPad it was Bundled
+// into the same app image as this page, and three screens still reported it
+// missing -- because this variant neither declared it nor called it, so the core
+// never loaded it and nothing ever asked it anything.
+//
+// IT IS AN OPTIONAL DEPENDENCY, NOT A REQUIRED ONE (metadata.json:
+// `web.optional_dependencies`). An app image carries it only when `--bundle`
+// asked for it, and the core refuses a module whose REQUIRED list it cannot
+// satisfy -- so declaring it hard would trade every wallet build without the
+// coordinator for the tabs below. Optional says exactly what is true: load it
+// if it is here, and this page finds out by asking.
+const QString kWalletBackend = QStringLiteral("wallet_backend_module");
 // What uniswap puts in a price's `address` field for a chain's NATIVE asset;
 // every other entry carries a real ERC-20 address. Not a display name — the
 // chain list's `nativeSymbol` is that, and is what the item is labelled with.
 const QString kNativeAsset = QStringLiteral("ETH");
+
+// The History tab with nothing in it, spelled once. The view reads
+// `historyJson.history`, and a tab emptied by a refusal and one emptied by a
+// wallet that has sent nothing are the same document.
+const QString kEmptyHistory = QStringLiteral("{\"history\":[]}");
 
 // THE FIVE WORDS `privateSyncJson.sync.state` IS EVER ONE OF, spelled once.
 // They are a contract, not a message: WalletView.qml colours the state label by
@@ -435,25 +455,44 @@ void WalletUiWebBackend::publishChains()
     setChainsJson(jsonText(root));
 }
 
-// ONLY FOR A MODULE THAT REALLY IS NOT HERE. `wallet_backend_module` is the
-// last one, which is why this variant talks to `eth_rpc_module`,
-// `uniswap_module` and `token_list_module` directly and still cannot serve
-// sends, fee estimation or history at all.
+// A METHOD THIS VARIANT HAS NOT WIRED UP, said in its own words.
 //
-// IT IS NOT THE ANSWER TO "THIS METHOD IS NOT IMPLEMENTED YET", and #147 is what
-// that mistake costs: `importMnemonic` refused with these words while
-// `keystore_module` — a `web` variant on a phone, loaded and answering
-// `list_accounts` in the same run — was right there. A reader was sent looking
-// for a missing build that was never missing. A method this variant has simply
-// not got to says so in its own words; only a missing module comes through here.
+// IT USED TO SAY "which has no mobile build", AND THAT IS NOW FALSE. Every
+// module this file names has a mobile build: `eth_rpc_module`, `uniswap_module`
+// and `token_list_module` are Bundled Bare members, `keystore_module` reaches a
+// phone as a `web` variant, and `wallet_backend_module` has been a catalog
+// member since #183 -- which is what made logos-workspace#250 read like a
+// packaging bug. A refusal that misnames its reason sends a reader looking for a
+// missing build that is not missing, and #147 measured what that costs one
+// module over.
+//
+// So this says what is actually true: the route is not built here. Sends and fee
+// estimation are the ones left -- a send parks a signing request with
+// `keystore_module` and is polled to a broadcast, and none of that route exists
+// in this variant yet. The module that would serve it is still NAMED, because
+// that is the part a developer reading the screen needs.
 QString WalletUiWebBackend::refuse(const QString& what, const QString& module)
 {
     const QString message =
-        QStringLiteral("%1 needs %2, which has no mobile build — the `web` variant "
-                       "does accounts, balances, prices and token lists")
+        QStringLiteral("%1 is %2's, and the `web` variant does not drive it yet")
             .arg(what, module);
     setStatusText(message);
     return failed(message);
+}
+
+// ...AND WHAT A COORDINATOR CALL THAT REALLY WAS REFUSED SAYS. Separate from
+// `refuse()` above because the two are different facts: one is a route this
+// image never built, the other is a module that answered, or a door that could
+// not reach one. `moduleRefused` puts the module's own words on the line, which
+// is how "the image does not carry the coordinator" and "the coordinator has no
+// state for this device" stay apart on a screen.
+void WalletUiWebBackend::coordinatorRefused(const QString& method,
+                                            const logos::web::ModuleCallResult& res,
+                                            const QJsonObject& reply)
+{
+    const QString said = moduleRefused(kWalletBackend, method, res, reply);
+    announce(said);
+    setStatusText(said);
 }
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -498,12 +537,83 @@ void WalletUiWebBackend::ensureChainConfig(int chainId, const QString& endpoint,
         });
 }
 
+namespace {
+
+// THE SETTINGS LINE FOR A DOCUMENT THE COORDINATOR ACCEPTED, which says WHAT
+// was applied and not that something was: the settings tab has two fields, and
+// a user who mistyped one needs to see which value the wallet is running with.
+//
+// `proxyRequired` is on both lines because it is the one that decides what
+// happens when the proxy is unreachable: a cleared proxy that is still required
+// is a wallet that will read nothing at all.
+QString proxyApplied(const QString& url, bool required)
+{
+    if (url.isEmpty()) {
+        return required ? QStringLiteral("Proxy cleared — but still required, so chain "
+                                         "reads will fail closed")
+                        : QStringLiteral("Proxy cleared");
+    }
+    return required ? QStringLiteral("Proxy applied: %1 (required)").arg(url)
+                    : QStringLiteral("Proxy applied: %1 (optional)").arg(url);
+}
+
+} // namespace
+
+// THE PROXY SETTINGS ARE THE COORDINATOR'S, and they are asked for now (#250).
+//
+// `wallet_backend_module` holds them and pushes them into `eth_rpc_module` for
+// every configured chain, which is why this is one call and not a walk over
+// `m_chains`: the fail-closed guarantee belongs to whoever owns the setting, and
+// a page that configured each chain itself would be a second copy of it.
+//
+// IT ANSWERS A BARE BOOL, not the `{ok, …}` envelope most of this wire uses --
+// the same shape as eth_rpc's `set_chain_config`, and read the same way. A
+// `false` is a REFUSAL: the module could not parse the document or had no state
+// to put it in, and reporting it as applied would leave a user believing their
+// traffic was proxied.
+//
+// The SLOT answers "taken", not "applied": the reply lands on `proxyStatus`,
+// because there is no value to return by the time this returns.
 bool WalletUiWebBackend::setProxyConfig(QString proxyJson)
 {
-    Q_UNUSED(proxyJson)
-    setProxyStatus(QStringLiteral("Proxy config is wallet_backend_module's"));
-    setStatusText(QStringLiteral("Proxy config needs wallet_backend_module"));
-    return false;
+    if (proxyJson.trimmed().isEmpty()) {
+        const QString why = QStringLiteral("Proxy config needs a document");
+        setProxyStatus(why);
+        setStatusText(why);
+        return false;
+    }
+
+    announce(QStringLiteral("setProxyConfig: asking %1, %2").arg(kWalletBackend, doorState()));
+    setProxyStatus(QStringLiteral("Applying…"));
+    logos::web::callModuleAsync(
+        kWalletBackend, QStringLiteral("set_proxy_config"), QJsonArray{ proxyJson },
+        [this, proxyJson](const logos::web::ModuleCallResult& res) {
+            if (!res.ok || !res.value.toBool()) {
+                // The module's words when it has them, the door's when it does
+                // not -- and never "no mobile build", which is what #250 found
+                // on this line with the coordinator sitting in the image.
+                const QString said = res.ok
+                    ? QStringLiteral("%1 refused set_proxy_config: the document could "
+                                     "not be applied").arg(kWalletBackend)
+                    : moduleRefused(kWalletBackend, QStringLiteral("set_proxy_config"),
+                                    res, QJsonObject{});
+                announce(said);
+                setProxyStatus(said);
+                setStatusText(said);
+                return;
+            }
+            // Read back from the document that was sent, because the module
+            // answers a bare `true` and carries nothing to report.
+            const QJsonObject asked =
+                QJsonDocument::fromJson(proxyJson.toUtf8()).object();
+            const QString applied =
+                proxyApplied(asked.value(QStringLiteral("proxy")).toString(),
+                             asked.value(QStringLiteral("proxyRequired")).toBool());
+            announce(applied);
+            setProxyStatus(applied);
+            setStatusText(applied);
+        });
+    return true;
 }
 
 bool WalletUiWebBackend::setChains(QString chainsJson)
@@ -1236,11 +1346,46 @@ QString WalletUiWebBackend::sendErc20(QString sendJson)
     return refuse(QStringLiteral("Sending"), QStringLiteral("wallet_backend_module"));
 }
 
+// HISTORY IS THE COORDINATOR'S, and it is asked for now (#250).
+//
+// `wallet_backend_module` keeps a local record of everything this wallet
+// broadcast and the receipts it has since read; there is nothing on the chain to
+// reconstruct it from and no other module holds it. On the operator's iPad this
+// method refused without asking, naming a module that was in the image -- so the
+// tab reported "History needs wallet_backend_module" with the module unloaded
+// three feet away.
+//
+// The reply IS the tab's document: `{ok, history: […]}` is what the view parses
+// (`parseField(historyJson, "history", [])`), so a successful answer is
+// published whole rather than rebuilt here.
 void WalletUiWebBackend::refreshHistory(QString address)
 {
-    Q_UNUSED(address)
-    refuse(QStringLiteral("History"), QStringLiteral("wallet_backend_module"));
-    setHistoryJson(QStringLiteral("{\"history\":[]}"));
+    if (address.trimmed().isEmpty()) {
+        setStatusText(QStringLiteral("History needs an account"));
+        setHistoryJson(kEmptyHistory);
+        return;
+    }
+
+    announce(QStringLiteral("refreshHistory: asking %1 for %2, %3")
+                 .arg(kWalletBackend, address, doorState()));
+    logos::web::callModuleAsync(
+        kWalletBackend, QStringLiteral("get_history"), QJsonArray{ address },
+        [this](const logos::web::ModuleCallResult& res) {
+            const QJsonObject reply = replyOf(res);
+            if (!callSucceeded(res, reply)) {
+                coordinatorRefused(QStringLiteral("get_history"), res, reply);
+                // EMPTIED, NOT LEFT. The rows on screen belong to whatever was
+                // asked for last, and leaving them under a refusal is a user
+                // reading another account's transactions as this one's.
+                setHistoryJson(kEmptyHistory);
+                return;
+            }
+            setHistoryJson(res.value.toString());
+            const int rows = reply.value(QStringLiteral("history")).toArray().size();
+            setStatusText(rows == 0 ? QStringLiteral("No transactions yet")
+                                    : QStringLiteral("History updated: %1 transaction(s)")
+                                          .arg(rows));
+        });
 }
 
 // ── the private sync: railgun_module, one window at a time ───────────────────
@@ -1253,17 +1398,29 @@ void WalletUiWebBackend::refreshHistory(QString address)
 // timeout. `sync_step` / `sync_status` / `sync_cancel` are the same work in
 // bounded windows, and this section is the wallet asking for them.
 //
-// WHY railgun_module IS NOT IN THIS VARIANT'S `web.dependencies`. The core
-// resolves a module's declared dependencies before loading it and REFUSES a
+// WHY railgun_module IS AN OPTIONAL DEPENDENCY AND NOT A REQUIRED ONE. The core
+// resolves a module's REQUIRED dependencies before loading it and REFUSES a
 // module whose list it cannot satisfy. `railgun_module` is a Bundled member an
-// image carries only when it was asked for (`--bundle railgun_module`), and
-// declaring it would mean a build without it could not load the wallet at
-// all — trading every wallet build for a tab. So the private surface is
-// DISCOVERED instead: the wallet asks, and a build that does not carry railgun
-// answers a refusal this file publishes as `unavailable` with the reason in it.
-// That is the same shape the catalog's derived floor takes for
-// `token_list_module` (ADR 0009) — a control a user can see refusing, rather
-// than a module that silently will not start.
+// image carries only when it was asked for (`--bundle railgun_module`), so
+// requiring it would mean a build without it could not load the wallet at
+// all — trading every wallet build for a tab.
+//
+// IT WAS UNDECLARED UNTIL #250, AND THAT WAS THE OTHER HALF OF THE SAME BUG.
+// "Discovered rather than declared" reads well and is not what the core does
+// with a name it has never been given: an undeclared module is never brought up,
+// so a page that asks for it is talking to something the loader left registered
+// and idle. `web.optional_dependencies` (metadata.json) is the shape that says
+// what was meant all along — bring it up if this image has it, and do not refuse
+// the wallet if it does not — and it is what `wallet_backend_module` is declared
+// under for exactly the same reason.
+//
+// A REFUSAL IS STILL PUBLISHED, because being loaded is not the same as being
+// usable: `railgun_module` holds no engine until something calls `init` /
+// `init_from_seed`, and NOTHING IN THIS WALLET DOES. Those keys are derived from
+// a deterministic EOA signature the keystore will only produce behind a human
+// approval in the Signer app, so bringing the private wallet up is its own route
+// and is not built here yet. Until it is, this surface says so in the module's
+// own words rather than showing a blank tab — see `privateSyncUnavailable`.
 //
 // ONE WINDOW IN FLIGHT AT A TIME, always. The next `sync_step` is issued from
 // inside the last one's reply, which is the rule every chained call in this
@@ -1272,8 +1429,8 @@ void WalletUiWebBackend::refreshHistory(QString address)
 // more than one window outstanding, "stop" is simply "do not ask for another".
 namespace {
 
-// The module that owns the accumulator. Reached by name and not declared —
-// see the section header for why.
+// The module that owns the accumulator. An OPTIONAL dependency of this variant
+// (metadata.json: `web.optional_dependencies`) — see the section header.
 const QString kRailgun = QStringLiteral("railgun_module");
 
 // HOW BIG A WINDOW A VIEW WANTS, which is not the module's own default. A
@@ -1519,7 +1676,21 @@ QString WalletUiWebBackend::privateSyncUnavailable(const QString& method,
     // that has not been initialised are the same blank tab to a user and two
     // different fixes to a developer, so the module and its own words both go on
     // the line.
-    const QString said = QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, why);
+    //
+    // AND THE SECOND OF THOSE GETS THE SENTENCE IT NEEDS (#250). "not
+    // initialized (call init first)" is accurate and tells a reader nothing they
+    // can act on -- it was what the operator's iPad showed, and the obvious
+    // reading (a broken module) is the wrong one. The module is fine; the
+    // private wallet has never been brought up, because bringing it up means a
+    // deterministic EOA signature the keystore only produces behind a human
+    // approval, and this variant does not drive that route yet.
+    const QString said =
+        why.contains(QStringLiteral("not initialized"))
+            ? QStringLiteral("%1 has no private wallet on this device yet: its keys are "
+                             "derived from a signature by this account, and the `web` "
+                             "variant does not ask for that approval yet (it refused %2: %3)")
+                  .arg(kRailgun, method, why)
+            : QStringLiteral("%1 refused %2: %3").arg(kRailgun, method, why);
     announce(said);
     setStatusText(said);
     publishPrivateSync(kStateUnavailable, QJsonObject{}, QString(), said);
